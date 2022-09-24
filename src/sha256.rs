@@ -56,7 +56,7 @@ pub trait Sha256Instructions<F: FieldExt>: Chip<F> {
 
 /// The output of a SHA-256 circuit invocation.
 #[derive(Debug)]
-pub struct Sha256Digest<BlockWord>([BlockWord; DIGEST_SIZE]);
+pub struct Sha256Digest<BlockWord>(pub [BlockWord; DIGEST_SIZE]);
 
 /// A gadget that constrains a SHA-256 invocation. It supports input at a granularity of
 /// 32 bits.
