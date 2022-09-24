@@ -6,7 +6,7 @@ use std::cmp::min;
 use std::convert::TryInto;
 use std::fmt;
 
-use halo2::{
+use halo2wrong::halo2::{
     arithmetic::FieldExt,
     circuit::{Chip, Layouter},
     plonk::Error,

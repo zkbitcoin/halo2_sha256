@@ -1,18 +1,17 @@
-use super::super::{
-    CellValue16, RoundWordA, RoundWordE, StateWord, Table16Assignment, ROUND_CONSTANTS,
-};
+use super::super::{AssignedBits, RoundWord, RoundWordA, RoundWordE, StateWord, ROUND_CONSTANTS};
 use super::{compression_util::*, CompressionConfig, State};
-use halo2::{arithmetic::FieldExt, circuit::Region, plonk::Error};
+use halo2wrong::curves::FieldExt;
+use halo2wrong::halo2::{circuit::Region, plonk::Error};
 
 impl CompressionConfig {
     #[allow(clippy::many_single_char_names)]
     pub fn assign_round<F: FieldExt>(
         &self,
         region: &mut Region<'_, F>,
-        idx: i32,
-        state: State,
-        schedule_word: (CellValue16, CellValue16),
-    ) -> Result<State, Error> {
+        round_idx: MainRoundIdx,
+        state: State<F>,
+        schedule_word: &(AssignedBits<16, F>, AssignedBits<16, F>),
+    ) -> Result<State<F>, Error> {
         let a_3 = self.extras[0];
         let a_4 = self.extras[1];
         let a_7 = self.extras[3];
@@ -20,70 +19,88 @@ impl CompressionConfig {
         let (a, b, c, d, e, f, g, h) = match_state(state);
 
         // s_upper_sigma_1(E)
-        let sigma_1 = self.assign_upper_sigma_1(region, idx, e.pieces.unwrap())?;
+        let sigma_1 = self.assign_upper_sigma_1(region, round_idx, e.pieces.clone().unwrap())?;
 
         // Ch(E, F, G)
-        let ch = self.assign_ch(region, idx, e.spread_halves.unwrap(), f.spread_halves)?;
-        let ch_neg = self.assign_ch_neg(region, idx, e.spread_halves.unwrap(), g.spread_halves)?;
+        let ch = self.assign_ch(
+            region,
+            round_idx,
+            e.spread_halves.clone().unwrap(),
+            f.spread_halves.clone(),
+        )?;
+        let ch_neg = self.assign_ch_neg(
+            region,
+            round_idx,
+            e.spread_halves.clone().unwrap(),
+            g.spread_halves.clone(),
+        )?;
 
         // s_upper_sigma_0(A)
-        let sigma_0 = self.assign_upper_sigma_0(region, idx, a.pieces.unwrap())?;
+        let sigma_0 = self.assign_upper_sigma_0(region, round_idx, a.pieces.clone().unwrap())?;
 
         // Maj(A, B, C)
         let maj = self.assign_maj(
             region,
-            idx,
-            a.spread_halves.unwrap(),
-            b.spread_halves,
-            c.spread_halves,
+            round_idx,
+            a.spread_halves.clone().unwrap(),
+            b.spread_halves.clone(),
+            c.spread_halves.clone(),
         )?;
 
         // H' = H + Ch(E, F, G) + s_upper_sigma_1(E) + K + W
         let h_prime = self.assign_h_prime(
             region,
-            idx,
-            h.dense_halves,
+            round_idx,
+            h,
             ch,
             ch_neg,
             sigma_1,
-            ROUND_CONSTANTS[idx as usize],
+            ROUND_CONSTANTS[round_idx.as_usize()],
             schedule_word,
         )?;
 
         // E_new = H' + D
-        let e_new_dense = self.assign_e_new(region, idx, d.dense_halves, h_prime)?;
-        let e_new_val = val_from_dense_halves(e_new_dense);
+        let e_new_dense = self.assign_e_new(region, round_idx, &d, &h_prime)?;
+        let e_new_val = e_new_dense.value();
 
         // A_new = H' + Maj(A, B, C) + sigma_0(A)
-        let a_new_dense = self.assign_a_new(region, idx, maj, sigma_0, h_prime)?;
-        let a_new_val = val_from_dense_halves(a_new_dense);
+        let a_new_dense = self.assign_a_new(region, round_idx, maj, sigma_0, h_prime)?;
+        let a_new_val = a_new_dense.value();
 
-        if idx < 63 {
+        if round_idx < 63.into() {
             // Assign and copy A_new
-            let a_new_row = get_decompose_a_row(idx + 1);
-            self.assign_and_constrain(region, || "a_new_lo", a_7, a_new_row, a_new_dense.0)?;
-            self.assign_and_constrain(region, || "a_new_hi", a_7, a_new_row + 1, a_new_dense.1)?;
+            let a_new_row = get_decompose_a_row((round_idx + 1).into());
+            a_new_dense
+                .0
+                .copy_advice(|| "a_new_lo", region, a_7, a_new_row)?;
+            a_new_dense
+                .1
+                .copy_advice(|| "a_new_hi", region, a_7, a_new_row + 1)?;
 
             // Assign and copy E_new
-            let e_new_row = get_decompose_e_row(idx + 1);
-            self.assign_and_constrain(region, || "e_new_lo", a_7, e_new_row, e_new_dense.0)?;
-            self.assign_and_constrain(region, || "e_new_hi", a_7, e_new_row + 1, e_new_dense.1)?;
+            let e_new_row = get_decompose_e_row((round_idx + 1).into());
+            e_new_dense
+                .0
+                .copy_advice(|| "e_new_lo", region, a_7, e_new_row)?;
+            e_new_dense
+                .1
+                .copy_advice(|| "e_new_hi", region, a_7, e_new_row + 1)?;
 
             // Decompose A into (2, 11, 9, 10)-bit chunks
-            let a_new = self.decompose_a(region, idx + 1, a_new_val)?;
+            let a_new = self.decompose_a(region, (round_idx + 1).into(), a_new_val)?;
 
             // Decompose E into (6, 5, 14, 7)-bit chunks
-            let e_new = self.decompose_e(region, idx + 1, e_new_val)?;
+            let e_new = self.decompose_e(region, (round_idx + 1).into(), e_new_val)?;
 
             Ok(State::new(
                 StateWord::A(a_new),
-                StateWord::B(a.into()),
+                StateWord::B(RoundWord::new(a.dense_halves, a.spread_halves.unwrap())),
                 StateWord::C(b),
-                StateWord::D(c.into()),
+                StateWord::D(c.dense_halves),
                 StateWord::E(e_new),
-                StateWord::F(e.into()),
+                StateWord::F(RoundWord::new(e.dense_halves, e.spread_halves.unwrap())),
                 StateWord::G(f),
-                StateWord::H(g.into()),
+                StateWord::H(g.dense_halves),
             ))
         } else {
             let abcd_row = get_digest_abcd_row();
@@ -97,13 +114,13 @@ impl CompressionConfig {
 
             Ok(State::new(
                 StateWord::A(RoundWordA::new_dense(a_final)),
-                StateWord::B(a.into()),
+                StateWord::B(RoundWord::new(a.dense_halves, a.spread_halves.unwrap())),
                 StateWord::C(b),
-                StateWord::D(c.into()),
+                StateWord::D(c.dense_halves),
                 StateWord::E(RoundWordE::new_dense(e_final)),
-                StateWord::F(e.into()),
+                StateWord::F(RoundWord::new(e.dense_halves, e.spread_halves.unwrap())),
                 StateWord::G(f),
-                StateWord::H(g.into()),
+                StateWord::H(g.dense_halves),
             ))
         }
     }

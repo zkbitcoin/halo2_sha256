@@ -1,10 +1,13 @@
+use std::convert::TryInto;
 use std::marker::PhantomData;
 
-use crate::Sha256Instructions;
-use halo2::{
-    arithmetic::FieldExt,
-    circuit::{Cell, Chip, Layouter, Region},
-    plonk::{Advice, Column, ConstraintSystem, Error},
+use super::Sha256Instructions;
+use halo2wrong::{
+    curves::FieldExt,
+    halo2::{
+        circuit::{AssignedCell, Chip, Layouter, Region, Value},
+        plonk::{Advice, Any, Assigned, Column, ConstraintSystem, Error},
+    },
 };
 
 mod compression;
@@ -17,6 +20,7 @@ use compression::*;
 use gates::*;
 use message_schedule::*;
 use spread_table::*;
+use util::*;
 
 const ROUNDS: usize = 64;
 const STATE: usize = 8;
@@ -46,59 +50,182 @@ const IV: [u32; STATE] = [
 
 #[derive(Clone, Copy, Debug, Default)]
 /// A word in a `Table16` message block.
-pub struct BlockWord(pub Option<u32>);
+// TODO: Make the internals of this struct private.
+pub struct BlockWord(pub Value<u32>);
 
-pub trait CellValue<T> {
-    fn var(&self) -> Cell;
-    fn value(&self) -> Option<T>;
-}
+#[derive(Clone, Debug)]
+/// Little-endian bits (up to 64 bits)
+pub struct Bits<const LEN: usize>([bool; LEN]);
 
-#[derive(Clone, Copy, Debug)]
-pub struct CellValue16 {
-    var: Cell,
-    value: Option<u16>,
-}
-
-impl<F: FieldExt> CellValue<F> for CellValue16 {
-    fn var(&self) -> Cell {
-        self.var
-    }
-    fn value(&self) -> Option<F> {
-        self.value.map(|value| F::from_u64(value as u64))
+impl<const LEN: usize> Bits<LEN> {
+    fn spread<const SPREAD: usize>(&self) -> [bool; SPREAD] {
+        spread_bits(self.0)
     }
 }
 
-impl CellValue16 {
-    pub fn new(var: Cell, value: Option<u16>) -> Self {
-        CellValue16 { var, value }
+impl<const LEN: usize> std::ops::Deref for Bits<LEN> {
+    type Target = [bool; LEN];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct CellValue32 {
-    var: Cell,
-    value: Option<u32>,
-}
-
-impl CellValue32 {
-    pub fn new(var: Cell, value: Option<u32>) -> Self {
-        CellValue32 { var, value }
+impl<const LEN: usize> From<[bool; LEN]> for Bits<LEN> {
+    fn from(bits: [bool; LEN]) -> Self {
+        Self(bits)
     }
 }
 
-impl<F: FieldExt> CellValue<F> for CellValue32 {
-    fn var(&self) -> Cell {
-        self.var
-    }
-    fn value(&self) -> Option<F> {
-        self.value.map(|value| F::from_u64(value as u64))
+impl<const LEN: usize> From<&Bits<LEN>> for [bool; LEN] {
+    fn from(bits: &Bits<LEN>) -> Self {
+        bits.0
     }
 }
 
-#[allow(clippy::from_over_into)]
-impl Into<CellValue32> for CellValue16 {
-    fn into(self) -> CellValue32 {
-        CellValue32::new(self.var, self.value.map(|value| value as u32))
+impl<const LEN: usize, F: FieldExt> From<&Bits<LEN>> for Assigned<F> {
+    fn from(bits: &Bits<LEN>) -> Assigned<F> {
+        assert!(LEN <= 64);
+        F::from(lebs2ip(&bits.0)).into()
+    }
+}
+
+impl From<&Bits<16>> for u16 {
+    fn from(bits: &Bits<16>) -> u16 {
+        lebs2ip(&bits.0) as u16
+    }
+}
+
+impl From<u16> for Bits<16> {
+    fn from(int: u16) -> Bits<16> {
+        Bits(i2lebsp::<16>(int.into()))
+    }
+}
+
+impl From<&Bits<32>> for u32 {
+    fn from(bits: &Bits<32>) -> u32 {
+        lebs2ip(&bits.0) as u32
+    }
+}
+
+impl From<u32> for Bits<32> {
+    fn from(int: u32) -> Bits<32> {
+        Bits(i2lebsp::<32>(int.into()))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AssignedBits<const LEN: usize, F: FieldExt>(AssignedCell<Bits<LEN>, F>);
+
+impl<const LEN: usize, F: FieldExt> std::ops::Deref for AssignedBits<LEN, F> {
+    type Target = AssignedCell<Bits<LEN>, F>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<const LEN: usize, F: FieldExt> AssignedBits<LEN, F> {
+    fn assign_bits<A, AR, T: TryInto<[bool; LEN]> + std::fmt::Debug + Clone>(
+        region: &mut Region<'_, F>,
+        annotation: A,
+        column: impl Into<Column<Any>>,
+        offset: usize,
+        value: Value<T>,
+    ) -> Result<Self, Error>
+    where
+        A: Fn() -> AR,
+        AR: Into<String>,
+        <T as TryInto<[bool; LEN]>>::Error: std::fmt::Debug,
+    {
+        let value: Value<[bool; LEN]> = value.map(|v| v.try_into().unwrap());
+        let value: Value<Bits<LEN>> = value.map(|v| v.into());
+
+        let column: Column<Any> = column.into();
+        match column.column_type() {
+            Any::Advice(_) => {
+                region.assign_advice(annotation, column.try_into().unwrap(), offset, || {
+                    value.clone()
+                })
+            }
+            Any::Fixed => {
+                region.assign_fixed(annotation, column.try_into().unwrap(), offset, || {
+                    value.clone()
+                })
+            }
+            _ => panic!("Cannot assign to instance column"),
+        }
+        .map(AssignedBits)
+    }
+}
+
+impl<F: FieldExt> AssignedBits<16, F> {
+    fn value_u16(&self) -> Value<u16> {
+        self.value().map(|v| v.into())
+    }
+
+    fn assign<A, AR>(
+        region: &mut Region<'_, F>,
+        annotation: A,
+        column: impl Into<Column<Any>>,
+        offset: usize,
+        value: Value<u16>,
+    ) -> Result<Self, Error>
+    where
+        A: Fn() -> AR,
+        AR: Into<String>,
+    {
+        let column: Column<Any> = column.into();
+        let value: Value<Bits<16>> = value.map(|v| v.into());
+        match column.column_type() {
+            Any::Advice(_) => {
+                region.assign_advice(annotation, column.try_into().unwrap(), offset, || {
+                    value.clone()
+                })
+            }
+            Any::Fixed => {
+                region.assign_fixed(annotation, column.try_into().unwrap(), offset, || {
+                    value.clone()
+                })
+            }
+            _ => panic!("Cannot assign to instance column"),
+        }
+        .map(AssignedBits)
+    }
+}
+
+impl<F: FieldExt> AssignedBits<32, F> {
+    fn value_u32(&self) -> Value<u32> {
+        self.value().map(|v| v.into())
+    }
+
+    fn assign<A, AR>(
+        region: &mut Region<'_, F>,
+        annotation: A,
+        column: impl Into<Column<Any>>,
+        offset: usize,
+        value: Value<u32>,
+    ) -> Result<Self, Error>
+    where
+        A: Fn() -> AR,
+        AR: Into<String>,
+    {
+        let column: Column<Any> = column.into();
+        let value: Value<Bits<32>> = value.map(|v| v.into());
+        match column.column_type() {
+            Any::Advice(_) => {
+                region.assign_advice(annotation, column.try_into().unwrap(), offset, || {
+                    value.clone()
+                })
+            }
+            Any::Fixed => {
+                region.assign_fixed(annotation, column.try_into().unwrap(), offset, || {
+                    value.clone()
+                })
+            }
+            _ => panic!("Cannot assign to instance column"),
+        }
+        .map(AssignedBits)
     }
 }
 
@@ -131,6 +258,7 @@ impl<F: FieldExt> Chip<F> for Table16Chip<F> {
 }
 
 impl<F: FieldExt> Table16Chip<F> {
+    /// Reconstructs this chip from the given config.
     pub fn construct(config: <Self as Chip<F>>::Config) -> Self {
         Self {
             config,
@@ -138,6 +266,7 @@ impl<F: FieldExt> Table16Chip<F> {
         }
     }
 
+    /// Configures a circuit to include this chip.
     pub fn configure(meta: &mut ConstraintSystem<F>) -> <Self as Chip<F>>::Config {
         // Columns required by this chip:
         let message_schedule = meta.advice_column();
@@ -172,7 +301,7 @@ impl<F: FieldExt> Table16Chip<F> {
 
         // Add all advice columns to permutation
         for column in [a_1, a_2, a_3, a_4, a_5, a_6, a_7, a_8].iter() {
-            meta.enable_equality((*column).into());
+            meta.enable_equality(*column);
         }
 
         let compression =
@@ -188,16 +317,17 @@ impl<F: FieldExt> Table16Chip<F> {
         }
     }
 
+    /// Loads the lookup table required by this chip into the circuit.
     pub fn load(config: Table16Config, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
         SpreadTableChip::load(config.lookup, layouter)
     }
 }
 
 impl<F: FieldExt> Sha256Instructions<F> for Table16Chip<F> {
-    type State = State;
+    type State = State<F>;
     type BlockWord = BlockWord;
 
-    fn initialization_vector(&self, layouter: &mut impl Layouter<F>) -> Result<State, Error> {
+    fn initialization_vector(&self, layouter: &mut impl Layouter<F>) -> Result<State<F>, Error> {
         self.config().compression.initialize_with_iv(layouter, IV)
     }
 
@@ -239,7 +369,7 @@ impl<F: FieldExt> Sha256Instructions<F> for Table16Chip<F> {
 
 /// Common assignment patterns used by Table16 regions.
 trait Table16Assignment<F: FieldExt> {
-    // Assign cells for general spread computation used in sigma, ch, ch_neg, maj gates
+    /// Assign cells for general spread computation used in sigma, ch, ch_neg, maj gates
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     fn assign_spread_outputs(
@@ -248,48 +378,51 @@ trait Table16Assignment<F: FieldExt> {
         lookup: &SpreadInputs,
         a_3: Column<Advice>,
         row: usize,
-        r_0_even: Option<u16>,
-        r_0_odd: Option<u16>,
-        r_1_even: Option<u16>,
-        r_1_odd: Option<u16>,
-    ) -> Result<((CellValue16, CellValue16), (CellValue16, CellValue16)), Error> {
+        r_0_even: Value<[bool; 16]>,
+        r_0_odd: Value<[bool; 16]>,
+        r_1_even: Value<[bool; 16]>,
+        r_1_odd: Value<[bool; 16]>,
+    ) -> Result<
+        (
+            (AssignedBits<16, F>, AssignedBits<16, F>),
+            (AssignedBits<16, F>, AssignedBits<16, F>),
+        ),
+        Error,
+    > {
         // Lookup R_0^{even}, R_0^{odd}, R_1^{even}, R_1^{odd}
-        let r_0_even =
-            SpreadVar::with_lookup(region, lookup, row - 1, SpreadWord::opt_new(r_0_even))?;
-        let r_0_odd = SpreadVar::with_lookup(region, lookup, row, SpreadWord::opt_new(r_0_odd))?;
-        let r_1_even =
-            SpreadVar::with_lookup(region, lookup, row + 1, SpreadWord::opt_new(r_1_even))?;
-        let r_1_odd =
-            SpreadVar::with_lookup(region, lookup, row + 2, SpreadWord::opt_new(r_1_odd))?;
+        let r_0_even = SpreadVar::with_lookup(
+            region,
+            lookup,
+            row - 1,
+            r_0_even.map(SpreadWord::<16, 32>::new),
+        )?;
+        let r_0_odd =
+            SpreadVar::with_lookup(region, lookup, row, r_0_odd.map(SpreadWord::<16, 32>::new))?;
+        let r_1_even = SpreadVar::with_lookup(
+            region,
+            lookup,
+            row + 1,
+            r_1_even.map(SpreadWord::<16, 32>::new),
+        )?;
+        let r_1_odd = SpreadVar::with_lookup(
+            region,
+            lookup,
+            row + 2,
+            r_1_odd.map(SpreadWord::<16, 32>::new),
+        )?;
 
         // Assign and copy R_1^{odd}
-        let r_1_odd_spread = region.assign_advice(
-            || "Assign and copy R_1^{odd}",
-            a_3,
-            row,
-            || {
-                r_1_odd
-                    .spread
-                    .value
-                    .map(|value| F::from_u64(value as u64))
-                    .ok_or(Error::SynthesisError)
-            },
-        )?;
-        region.constrain_equal(r_1_odd.spread.var, r_1_odd_spread)?;
+        r_1_odd
+            .spread
+            .copy_advice(|| "Assign and copy R_1^{odd}", region, a_3, row)?;
 
         Ok((
-            (
-                CellValue16::new(r_0_even.dense.var, r_0_even.dense.value),
-                CellValue16::new(r_1_even.dense.var, r_1_even.dense.value),
-            ),
-            (
-                CellValue16::new(r_0_odd.dense.var, r_0_odd.dense.value),
-                CellValue16::new(r_1_odd.dense.var, r_1_odd.dense.value),
-            ),
+            (r_0_even.dense, r_1_even.dense),
+            (r_0_odd.dense, r_1_odd.dense),
         ))
     }
 
-    // Assign outputs of sigma gates
+    /// Assign outputs of sigma gates
     #[allow(clippy::too_many_arguments)]
     fn assign_sigma_outputs(
         &self,
@@ -297,88 +430,31 @@ trait Table16Assignment<F: FieldExt> {
         lookup: &SpreadInputs,
         a_3: Column<Advice>,
         row: usize,
-        r_0_even: Option<u16>,
-        r_0_odd: Option<u16>,
-        r_1_even: Option<u16>,
-        r_1_odd: Option<u16>,
-    ) -> Result<(CellValue16, CellValue16), Error> {
+        r_0_even: Value<[bool; 16]>,
+        r_0_odd: Value<[bool; 16]>,
+        r_1_even: Value<[bool; 16]>,
+        r_1_odd: Value<[bool; 16]>,
+    ) -> Result<(AssignedBits<16, F>, AssignedBits<16, F>), Error> {
         let (even, _odd) = self.assign_spread_outputs(
             region, lookup, a_3, row, r_0_even, r_0_odd, r_1_even, r_1_odd,
         )?;
 
         Ok(even)
     }
-
-    // Assign a cell the same value as another cell and set up a copy constraint between them
-    fn assign_and_constrain<A, AR>(
-        &self,
-        region: &mut Region<'_, F>,
-        annotation: A,
-        column: Column<Advice>,
-        row: usize,
-        copy: impl CellValue<F>,
-    ) -> Result<Cell, Error>
-    where
-        A: Fn() -> AR,
-        AR: Into<String>,
-    {
-        let cell = region.assign_advice(annotation, column, row, || {
-            copy.value().ok_or(Error::SynthesisError)
-        })?;
-        region.constrain_equal(cell, copy.var())?;
-        Ok(cell)
-    }
 }
 
 #[cfg(test)]
+#[cfg(feature = "dev-graph")]
 mod tests {
-    #[cfg(feature = "dev-graph")]
+    use super::super::{Sha256, BLOCK_SIZE};
+    use super::{message_schedule::msg_schedule_test_input, Table16Chip, Table16Config};
+    use halo2wrong::halo2::{
+        circuit::{Layouter, SimpleFloorPlanner},
+        plonk::{Circuit, ConstraintSystem, Error},
+    };
+
     #[test]
     fn print_sha256_circuit() {
-        struct MyCircuit {}
-
-        impl<F: FieldExt> Circuit<F> for MyCircuit {
-            type Config = Table16Config;
-            type FloorPlanner = SimpleFloorPlanner;
-
-            fn without_witnesses(&self) -> Self {
-                MyCircuit {}
-            }
-
-            fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-                Table16Chip::configure(meta)
-            }
-
-            fn synthesize(
-                &self,
-                config: Self::Config,
-                mut layouter: impl Layouter<F>,
-            ) -> Result<(), Error> {
-                let table16_chip = Table16Chip::<F>::construct(config.clone());
-                Table16Chip::<F>::load(config, &mut layouter)?;
-
-                // Test vector: "abc"
-                let test_input = msg_schedule_test_input();
-
-                // Create a message of length 31 blocks
-                let mut input = Vec::with_capacity(31 * BLOCK_SIZE);
-                for _ in 0..31 {
-                    input.extend_from_slice(&test_input);
-                }
-
-                Sha256::digest(table16_chip, layouter.namespace(|| "'abc' * 31"), &input)?;
-
-                Ok(())
-            }
-        }
-
-        let circuit: MyCircuit = MyCircuit {};
-        eprintln!("{}", halo2::dev::circuit_dot_graph::<Fq, _>(&circuit));
-    }
-
-    #[cfg(feature = "dev-graph")]
-    #[test]
-    fn print_table16_chip() {
         use plotters::prelude::*;
         struct MyCircuit {}
 
@@ -399,34 +475,34 @@ mod tests {
                 config: Self::Config,
                 mut layouter: impl Layouter<F>,
             ) -> Result<(), Error> {
-                let table16_chip = Table16Chip::<F>::construct(config.clone());
-                Table16Chip::<F>::load(config, &mut layouter)?;
+                let table16_chip = Table16Chip::construct(config.clone());
+                Table16Chip::load(config, &mut layouter)?;
 
                 // Test vector: "abc"
                 let test_input = msg_schedule_test_input();
 
-                // Create a message of length 2 blocks
-                let mut input = Vec::with_capacity(2 * BLOCK_SIZE);
-                for _ in 0..2 {
+                // Create a message of length 31 blocks
+                let mut input = Vec::with_capacity(31 * BLOCK_SIZE);
+                for _ in 0..31 {
                     input.extend_from_slice(&test_input);
                 }
 
-                Sha256::digest(table16_chip, layouter.namespace(|| "'abc' * 2"), &input)?;
+                Sha256::digest(table16_chip, layouter.namespace(|| "'abc' * 31"), &input)?;
 
                 Ok(())
             }
         }
 
         let root =
-            SVGBackend::new("sha-256-table16-chip-layout.svg", (1024, 20480)).into_drawing_area();
+            BitMapBackend::new("sha-256-table16-chip-layout.png", (1024, 3480)).into_drawing_area();
         root.fill(&WHITE).unwrap();
         let root = root
             .titled("16-bit Table SHA-256 Chip", ("sans-serif", 60))
             .unwrap();
 
         let circuit = MyCircuit {};
-        halo2::dev::CircuitLayout::default()
-            .render::<Fq, _, _>(&circuit, &root)
+        halo2_proofs::dev::CircuitLayout::default()
+            .render::<pallas::Base, _, _>(17, &circuit, &root)
             .unwrap();
     }
 }

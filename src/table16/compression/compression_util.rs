@@ -1,15 +1,16 @@
 use super::{
-    AbcdVar, CompressionConfig, EfghVar, RoundWordA, RoundWordDense, RoundWordE, RoundWordSpread,
-    State,
+    AbcdVar, CompressionConfig, EfghVar, RoundWord, RoundWordA, RoundWordDense, RoundWordE,
+    RoundWordSpread, State, UpperSigmaVar,
 };
-use crate::table16::{
-    util::*, CellValue16, CellValue32, SpreadVar, SpreadWord, StateWord, Table16Assignment,
+use crate::table16::{util::*, AssignedBits, SpreadVar, SpreadWord, StateWord, Table16Assignment};
+use halo2wrong::{
+    curves::FieldExt,
+    halo2::{
+        circuit::{Region, Value},
+        plonk::{Advice, Column, Error},
+    },
 };
-use halo2::{
-    arithmetic::FieldExt,
-    circuit::Region,
-    plonk::{Advice, Column, Error},
-};
+use std::convert::TryInto;
 
 // Test vector 'abc'
 #[cfg(test)]
@@ -38,101 +39,154 @@ pub const SUBREGION_MAIN_WORD: usize =
     DECOMPOSE_ABCD + SIGMA_0_ROWS + DECOMPOSE_EFGH + SIGMA_1_ROWS + CH_ROWS + MAJ_ROWS;
 pub const SUBREGION_MAIN_ROWS: usize = SUBREGION_MAIN_LEN * SUBREGION_MAIN_WORD;
 
-/// Returns starting row number of a compression round
-pub fn get_round_row(round_idx: i32) -> usize {
-    assert!(round_idx >= -1);
-    assert!(round_idx < 64);
-    if round_idx == -1 {
-        // Init subregion
-        0
-    } else {
-        // Main subregion
-        (round_idx as usize) * SUBREGION_MAIN_WORD
+/// The initial round.
+pub struct InitialRound;
+
+/// A main round index.
+#[derive(Debug, Copy, Clone)]
+pub struct MainRoundIdx(usize);
+
+/// Round index.
+#[derive(Debug, Copy, Clone)]
+pub enum RoundIdx {
+    Init,
+    Main(MainRoundIdx),
+}
+
+impl From<InitialRound> for RoundIdx {
+    fn from(_: InitialRound) -> Self {
+        RoundIdx::Init
     }
 }
 
-pub fn get_decompose_e_row(round_idx: i32) -> usize {
+impl From<MainRoundIdx> for RoundIdx {
+    fn from(idx: MainRoundIdx) -> Self {
+        RoundIdx::Main(idx)
+    }
+}
+
+impl MainRoundIdx {
+    pub(crate) fn as_usize(&self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for MainRoundIdx {
+    fn from(idx: usize) -> Self {
+        MainRoundIdx(idx)
+    }
+}
+
+impl std::ops::Add<usize> for MainRoundIdx {
+    type Output = Self;
+
+    fn add(self, rhs: usize) -> Self::Output {
+        MainRoundIdx(self.0 + rhs)
+    }
+}
+
+impl Ord for MainRoundIdx {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl PartialOrd for MainRoundIdx {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for MainRoundIdx {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for MainRoundIdx {}
+
+/// Returns starting row number of a compression round
+pub fn get_round_row(round_idx: RoundIdx) -> usize {
+    match round_idx {
+        RoundIdx::Init => 0,
+        RoundIdx::Main(MainRoundIdx(idx)) => {
+            assert!(idx < 64);
+            (idx as usize) * SUBREGION_MAIN_WORD
+        }
+    }
+}
+
+pub fn get_decompose_e_row(round_idx: RoundIdx) -> usize {
     get_round_row(round_idx)
 }
 
-pub fn get_decompose_f_row(round_idx: i32) -> usize {
-    assert_eq!(round_idx, -1);
-    get_decompose_e_row(round_idx) + DECOMPOSE_EFGH
+pub fn get_decompose_f_row(round_idx: InitialRound) -> usize {
+    get_decompose_e_row(round_idx.into()) + DECOMPOSE_EFGH
 }
 
-pub fn get_decompose_g_row(round_idx: i32) -> usize {
+pub fn get_decompose_g_row(round_idx: InitialRound) -> usize {
     get_decompose_f_row(round_idx) + DECOMPOSE_EFGH
 }
 
-pub fn get_upper_sigma_1_row(round_idx: i32) -> usize {
-    assert!(round_idx >= 0);
-    get_decompose_e_row(round_idx) + DECOMPOSE_EFGH + 1
+pub fn get_upper_sigma_1_row(round_idx: MainRoundIdx) -> usize {
+    get_decompose_e_row(round_idx.into()) + DECOMPOSE_EFGH + 1
 }
 
-pub fn get_ch_row(round_idx: i32) -> usize {
-    assert!(round_idx >= 0);
-    get_decompose_e_row(round_idx) + DECOMPOSE_EFGH + SIGMA_1_ROWS + 1
+pub fn get_ch_row(round_idx: MainRoundIdx) -> usize {
+    get_decompose_e_row(round_idx.into()) + DECOMPOSE_EFGH + SIGMA_1_ROWS + 1
 }
 
-pub fn get_ch_neg_row(round_idx: i32) -> usize {
+pub fn get_ch_neg_row(round_idx: MainRoundIdx) -> usize {
     get_ch_row(round_idx) + CH_ROWS / 2
 }
 
-pub fn get_decompose_a_row(round_idx: i32) -> usize {
-    if round_idx == -1 {
-        get_h_row(round_idx) + DECOMPOSE_EFGH
-    } else {
-        get_ch_neg_row(round_idx) - 1 + CH_ROWS / 2
+pub fn get_decompose_a_row(round_idx: RoundIdx) -> usize {
+    match round_idx {
+        RoundIdx::Init => get_h_row(round_idx) + DECOMPOSE_EFGH,
+        RoundIdx::Main(mri) => get_ch_neg_row(mri) - 1 + CH_ROWS / 2,
     }
 }
 
-pub fn get_upper_sigma_0_row(round_idx: i32) -> usize {
-    assert!(round_idx >= 0);
-    get_decompose_a_row(round_idx) + DECOMPOSE_ABCD + 1
+pub fn get_upper_sigma_0_row(round_idx: MainRoundIdx) -> usize {
+    get_decompose_a_row(round_idx.into()) + DECOMPOSE_ABCD + 1
 }
 
-pub fn get_decompose_b_row(round_idx: i32) -> usize {
-    assert_eq!(round_idx, -1);
-    get_decompose_a_row(round_idx) + DECOMPOSE_ABCD
+pub fn get_decompose_b_row(round_idx: InitialRound) -> usize {
+    get_decompose_a_row(round_idx.into()) + DECOMPOSE_ABCD
 }
 
-pub fn get_decompose_c_row(round_idx: i32) -> usize {
+pub fn get_decompose_c_row(round_idx: InitialRound) -> usize {
     get_decompose_b_row(round_idx) + DECOMPOSE_ABCD
 }
 
-pub fn get_maj_row(round_idx: i32) -> usize {
-    assert!(round_idx >= 0);
+pub fn get_maj_row(round_idx: MainRoundIdx) -> usize {
     get_upper_sigma_0_row(round_idx) + SIGMA_0_ROWS
 }
 
 // Get state word rows
-pub fn get_h_row(round_idx: i32) -> usize {
-    if round_idx == -1 {
-        get_decompose_g_row(round_idx) + DECOMPOSE_EFGH
-    } else {
-        get_ch_row(round_idx) - 1
+pub fn get_h_row(round_idx: RoundIdx) -> usize {
+    match round_idx {
+        RoundIdx::Init => get_decompose_g_row(InitialRound) + DECOMPOSE_EFGH,
+        RoundIdx::Main(mri) => get_ch_row(mri) - 1,
     }
 }
 
-pub fn get_h_prime_row(round_idx: i32) -> usize {
-    assert!(round_idx >= 0);
+pub fn get_h_prime_row(round_idx: MainRoundIdx) -> usize {
     get_ch_row(round_idx)
 }
 
-pub fn get_d_row(round_idx: i32) -> usize {
-    if round_idx == -1 {
-        get_decompose_c_row(round_idx) + DECOMPOSE_ABCD
-    } else {
-        get_ch_row(round_idx) + 2
+pub fn get_d_row(round_idx: RoundIdx) -> usize {
+    match round_idx {
+        RoundIdx::Init => get_decompose_c_row(InitialRound) + DECOMPOSE_ABCD,
+        RoundIdx::Main(mri) => get_ch_row(mri) + 2,
     }
 }
 
-pub fn get_e_new_row(round_idx: i32) -> usize {
-    assert!(round_idx >= 0);
-    get_d_row(round_idx)
+pub fn get_e_new_row(round_idx: MainRoundIdx) -> usize {
+    get_d_row(round_idx.into())
 }
 
-pub fn get_a_new_row(round_idx: i32) -> usize {
+pub fn get_a_new_row(round_idx: MainRoundIdx) -> usize {
     get_maj_row(round_idx)
 }
 
@@ -149,210 +203,215 @@ impl CompressionConfig {
         &self,
         region: &mut Region<'_, F>,
         row: usize,
-        a_val: Option<u32>,
-    ) -> Result<
-        (
-            SpreadVar,
-            SpreadVar,
-            SpreadVar,
-            SpreadVar,
-            SpreadVar,
-            SpreadVar,
-        ),
-        Error,
-    > {
-        region.assign_fixed(
-            || "s_decompose_abcd",
-            self.s_decompose_abcd,
-            row,
-            || Ok(F::one()),
-        )?;
+        val: Value<u32>,
+    ) -> Result<AbcdVar<F>, Error> {
+        self.s_decompose_abcd.enable(region, row)?;
 
         let a_3 = self.extras[0];
         let a_4 = self.extras[1];
         let a_5 = self.message_schedule;
         let a_6 = self.extras[2];
 
-        let a_spread_pieces = a_val.map(|a_val| {
-            chop_u32(a_val, &[2, 11, 3, 3, 3, 10])
-                .iter()
-                .map(|piece| SpreadWord::new(*piece as u16))
-                .collect::<Vec<_>>()
-        });
-        let a_spread_pieces = transpose_option_vec(a_spread_pieces, 6);
+        let spread_pieces = val.map(AbcdVar::<F>::pieces);
+        let spread_pieces = spread_pieces.transpose_vec(6);
 
-        let a = SpreadVar::without_lookup(region, a_3, row + 1, a_4, row + 1, a_spread_pieces[0])?;
-        let b = SpreadVar::with_lookup(region, &self.lookup, row, a_spread_pieces[1])?;
-        let c_lo = SpreadVar::without_lookup(region, a_3, row, a_4, row, a_spread_pieces[2])?;
-        let c_mid = SpreadVar::without_lookup(region, a_5, row, a_6, row, a_spread_pieces[3])?;
-        let c_hi =
-            SpreadVar::without_lookup(region, a_5, row + 1, a_6, row + 1, a_spread_pieces[4])?;
-        let d = SpreadVar::with_lookup(region, &self.lookup, row + 1, a_spread_pieces[5])?;
-
-        Ok((a, b, c_lo, c_mid, c_hi, d))
-    }
-
-    pub(super) fn decompose_efgh<F: FieldExt>(
-        &self,
-        region: &mut Region<'_, F>,
-        row: usize,
-        val: Option<u32>,
-    ) -> Result<
-        (
-            SpreadVar,
-            SpreadVar,
-            SpreadVar,
-            SpreadVar,
-            SpreadVar,
-            SpreadVar,
-        ),
-        Error,
-    > {
-        region.assign_fixed(
-            || "s_decompose_efgh",
-            self.s_decompose_efgh,
+        let a = SpreadVar::without_lookup(
+            region,
+            a_3,
+            row + 1,
+            a_4,
+            row + 1,
+            spread_pieces[0].clone().map(SpreadWord::<2, 4>::try_new),
+        )?;
+        let b = SpreadVar::with_lookup(
+            region,
+            &self.lookup,
             row,
-            || Ok(F::one()),
+            spread_pieces[1].clone().map(SpreadWord::<11, 22>::try_new),
+        )?;
+        let c_lo = SpreadVar::without_lookup(
+            region,
+            a_3,
+            row,
+            a_4,
+            row,
+            spread_pieces[2].clone().map(SpreadWord::<3, 6>::try_new),
+        )?;
+        let c_mid = SpreadVar::without_lookup(
+            region,
+            a_5,
+            row,
+            a_6,
+            row,
+            spread_pieces[3].clone().map(SpreadWord::<3, 6>::try_new),
+        )?;
+        let c_hi = SpreadVar::without_lookup(
+            region,
+            a_5,
+            row + 1,
+            a_6,
+            row + 1,
+            spread_pieces[4].clone().map(SpreadWord::<3, 6>::try_new),
+        )?;
+        let d = SpreadVar::with_lookup(
+            region,
+            &self.lookup,
+            row + 1,
+            spread_pieces[5].clone().map(SpreadWord::<10, 20>::try_new),
         )?;
 
-        let a_3 = self.extras[0];
-        let a_4 = self.extras[1];
-        let a_5 = self.message_schedule;
-        let a_6 = self.extras[2];
-
-        let spread_pieces = val.map(|val| {
-            chop_u32(val, &[3, 3, 2, 3, 14, 7])
-                .iter()
-                .map(|piece| SpreadWord::new(*piece as u16))
-                .collect::<Vec<_>>()
-        });
-        let spread_pieces = transpose_option_vec(spread_pieces, 6);
-
-        let a_lo = SpreadVar::without_lookup(region, a_3, row + 1, a_4, row + 1, spread_pieces[0])?;
-        let a_hi = SpreadVar::without_lookup(region, a_5, row + 1, a_6, row + 1, spread_pieces[1])?;
-        let b_lo = SpreadVar::without_lookup(region, a_3, row, a_4, row, spread_pieces[2])?;
-        let b_hi = SpreadVar::without_lookup(region, a_5, row, a_6, row, spread_pieces[3])?;
-        let c = SpreadVar::with_lookup(region, &self.lookup, row + 1, spread_pieces[4])?;
-        let d = SpreadVar::with_lookup(region, &self.lookup, row, spread_pieces[5])?;
-
-        Ok((a_lo, a_hi, b_lo, b_hi, c, d))
-    }
-
-    pub(super) fn decompose_a<F: FieldExt>(
-        &self,
-        region: &mut Region<'_, F>,
-        idx: i32,
-        a_val: Option<u32>,
-    ) -> Result<RoundWordA, Error> {
-        let row = get_decompose_a_row(idx);
-
-        let (dense_halves, spread_halves) = self.assign_word_halves(region, row, a_val)?;
-        let (a, b, c_lo, c_mid, c_hi, d) = self.decompose_abcd(region, row, a_val)?;
-        let a_pieces = AbcdVar {
-            idx,
-            val: a_val,
+        Ok(AbcdVar {
             a,
             b,
             c_lo,
             c_mid,
             c_hi,
             d,
-        };
-        Ok(RoundWordA::new(a_pieces, dense_halves, spread_halves))
+        })
     }
 
-    pub(super) fn decompose_e<F: FieldExt>(
+    pub(super) fn decompose_efgh<F: FieldExt>(
         &self,
         region: &mut Region<'_, F>,
-        idx: i32,
-        e_val: Option<u32>,
-    ) -> Result<RoundWordE, Error> {
-        let row = get_decompose_e_row(idx);
+        row: usize,
+        val: Value<u32>,
+    ) -> Result<EfghVar<F>, Error> {
+        self.s_decompose_efgh.enable(region, row)?;
 
-        let (dense_halves, spread_halves) = self.assign_word_halves(region, row, e_val)?;
-        let (a_lo, a_hi, b_lo, b_hi, c, d) = self.decompose_efgh(region, row, e_val)?;
-        let e_pieces = EfghVar {
-            idx,
-            val: e_val,
+        let a_3 = self.extras[0];
+        let a_4 = self.extras[1];
+        let a_5 = self.message_schedule;
+        let a_6 = self.extras[2];
+
+        let spread_pieces = val.map(EfghVar::<F>::pieces);
+        let spread_pieces = spread_pieces.transpose_vec(6);
+
+        let a_lo = SpreadVar::without_lookup(
+            region,
+            a_3,
+            row + 1,
+            a_4,
+            row + 1,
+            spread_pieces[0].clone().map(SpreadWord::try_new),
+        )?;
+        let a_hi = SpreadVar::without_lookup(
+            region,
+            a_5,
+            row + 1,
+            a_6,
+            row + 1,
+            spread_pieces[1].clone().map(SpreadWord::try_new),
+        )?;
+        let b_lo = SpreadVar::without_lookup(
+            region,
+            a_3,
+            row,
+            a_4,
+            row,
+            spread_pieces[2].clone().map(SpreadWord::try_new),
+        )?;
+        let b_hi = SpreadVar::without_lookup(
+            region,
+            a_5,
+            row,
+            a_6,
+            row,
+            spread_pieces[3].clone().map(SpreadWord::try_new),
+        )?;
+        let c = SpreadVar::with_lookup(
+            region,
+            &self.lookup,
+            row + 1,
+            spread_pieces[4].clone().map(SpreadWord::try_new),
+        )?;
+        let d = SpreadVar::with_lookup(
+            region,
+            &self.lookup,
+            row,
+            spread_pieces[5].clone().map(SpreadWord::try_new),
+        )?;
+
+        Ok(EfghVar {
             a_lo,
             a_hi,
             b_lo,
             b_hi,
             c,
             d,
-        };
+        })
+    }
+
+    pub(super) fn decompose_a<F: FieldExt>(
+        &self,
+        region: &mut Region<'_, F>,
+        round_idx: RoundIdx,
+        a_val: Value<u32>,
+    ) -> Result<RoundWordA<F>, Error> {
+        let row = get_decompose_a_row(round_idx);
+
+        let (dense_halves, spread_halves) = self.assign_word_halves(region, row, a_val)?;
+        let a_pieces = self.decompose_abcd(region, row, a_val)?;
+        Ok(RoundWordA::new(a_pieces, dense_halves, spread_halves))
+    }
+
+    pub(super) fn decompose_e<F: FieldExt>(
+        &self,
+        region: &mut Region<'_, F>,
+        round_idx: RoundIdx,
+        e_val: Value<u32>,
+    ) -> Result<RoundWordE<F>, Error> {
+        let row = get_decompose_e_row(round_idx);
+
+        let (dense_halves, spread_halves) = self.assign_word_halves(region, row, e_val)?;
+        let e_pieces = self.decompose_efgh(region, row, e_val)?;
         Ok(RoundWordE::new(e_pieces, dense_halves, spread_halves))
     }
 
     pub(super) fn assign_upper_sigma_0<F: FieldExt>(
         &self,
         region: &mut Region<'_, F>,
-        idx: i32,
-        word: AbcdVar,
-    ) -> Result<(CellValue16, CellValue16), Error> {
+        round_idx: MainRoundIdx,
+        word: AbcdVar<F>,
+    ) -> Result<(AssignedBits<16, F>, AssignedBits<16, F>), Error> {
         // Rename these here for ease of matching the gates to the specification.
         let a_3 = self.extras[0];
         let a_4 = self.extras[1];
         let a_5 = self.message_schedule;
 
-        let row = get_upper_sigma_0_row(idx);
+        let row = get_upper_sigma_0_row(round_idx);
 
-        region.assign_fixed(
-            || "s_upper_sigma_0",
-            self.s_upper_sigma_0,
-            row,
-            || Ok(F::one()),
-        )?;
+        self.s_upper_sigma_0.enable(region, row)?;
 
         // Assign `spread_a` and copy constraint
-        self.assign_and_constrain(region, || "spread_a", a_3, row + 1, word.a.spread)?;
+        word.a
+            .spread
+            .copy_advice(|| "spread_a", region, a_3, row + 1)?;
         // Assign `spread_b` and copy constraint
-        self.assign_and_constrain(region, || "spread_b", a_5, row, word.b.spread)?;
+        word.b.spread.copy_advice(|| "spread_b", region, a_5, row)?;
         // Assign `spread_c_lo` and copy constraint
-        self.assign_and_constrain(region, || "spread_c_lo", a_3, row - 1, word.c_lo.spread)?;
+        word.c_lo
+            .spread
+            .copy_advice(|| "spread_c_lo", region, a_3, row - 1)?;
         // Assign `spread_c_mid` and copy constraint
-        self.assign_and_constrain(region, || "spread_c_mid", a_4, row - 1, word.c_mid.spread)?;
+        word.c_mid
+            .spread
+            .copy_advice(|| "spread_c_mid", region, a_4, row - 1)?;
         // Assign `spread_c_hi` and copy constraint
-        self.assign_and_constrain(region, || "spread_c_hi", a_4, row + 1, word.c_hi.spread)?;
+        word.c_hi
+            .spread
+            .copy_advice(|| "spread_c_hi", region, a_4, row + 1)?;
         // Assign `spread_d` and copy constraint
-        self.assign_and_constrain(region, || "spread_d", a_4, row, word.d.spread)?;
+        word.d.spread.copy_advice(|| "spread_d", region, a_4, row)?;
 
         // Calculate R_0^{even}, R_0^{odd}, R_1^{even}, R_1^{odd}
-        let (r_0_even, r_0_odd, r_1_even, r_1_odd) = if word.a.spread.value.is_some() {
-            let spread_a = word.a.spread.value.unwrap() as u64;
-            let spread_b = word.b.spread.value.unwrap() as u64;
-            let spread_c_lo = word.c_lo.spread.value.unwrap() as u64;
-            let spread_c_mid = word.c_mid.spread.value.unwrap() as u64;
-            let spread_c_hi = word.c_hi.spread.value.unwrap() as u64;
-            let spread_d = word.d.spread.value.unwrap() as u64;
+        let r = word.xor_upper_sigma();
+        let r_0: Value<[bool; 32]> = r.map(|r| r[..32].try_into().unwrap());
+        let r_0_even = r_0.map(even_bits);
+        let r_0_odd = r_0.map(odd_bits);
 
-            let xor_0 = spread_b
-                + (1 << 22) * spread_c_lo
-                + (1 << 28) * spread_c_mid
-                + (1 << 34) * spread_c_hi
-                + (1 << 40) * spread_d
-                + (1 << 60) * spread_a;
-            let xor_1 = spread_c_lo
-                + (1 << 6) * spread_c_mid
-                + (1 << 12) * spread_c_hi
-                + (1 << 18) * spread_d
-                + (1 << 38) * spread_a
-                + (1 << 42) * spread_b;
-            let xor_2 = spread_d
-                + (1 << 20) * spread_a
-                + (1 << 24) * spread_b
-                + (1 << 46) * spread_c_lo
-                + (1 << 52) * spread_c_mid
-                + (1 << 58) * spread_c_hi;
-            let r = xor_0 + xor_1 + xor_2;
-            let r_pieces = chop_u64(r, &[32, 32]); // r_0, r_1
-            let (r_0_even, r_0_odd) = get_even_and_odd_bits_u32(r_pieces[0] as u32);
-            let (r_1_even, r_1_odd) = get_even_and_odd_bits_u32(r_pieces[1] as u32);
-
-            (Some(r_0_even), Some(r_0_odd), Some(r_1_even), Some(r_1_odd))
-        } else {
-            (None, None, None, None)
-        };
+        let r_1: Value<[bool; 32]> = r.map(|r| r[32..].try_into().unwrap());
+        let r_1_even = r_1.map(even_bits);
+        let r_1_odd = r_1.map(odd_bits);
 
         self.assign_sigma_outputs(
             region,
@@ -369,72 +428,49 @@ impl CompressionConfig {
     pub(super) fn assign_upper_sigma_1<F: FieldExt>(
         &self,
         region: &mut Region<'_, F>,
-        idx: i32,
-        word: EfghVar,
-    ) -> Result<(CellValue16, CellValue16), Error> {
+        round_idx: MainRoundIdx,
+        word: EfghVar<F>,
+    ) -> Result<(AssignedBits<16, F>, AssignedBits<16, F>), Error> {
         // Rename these here for ease of matching the gates to the specification.
         let a_3 = self.extras[0];
         let a_4 = self.extras[1];
         let a_5 = self.message_schedule;
 
-        let row = get_upper_sigma_1_row(idx);
+        let row = get_upper_sigma_1_row(round_idx);
 
-        region.assign_fixed(
-            || "s_upper_sigma_1",
-            self.s_upper_sigma_1,
-            row,
-            || Ok(F::one()),
-        )?;
+        self.s_upper_sigma_1.enable(region, row)?;
 
         // Assign `spread_a_lo` and copy constraint
-        self.assign_and_constrain(region, || "spread_a_lo", a_3, row + 1, word.a_lo.spread)?;
+        word.a_lo
+            .spread
+            .copy_advice(|| "spread_a_lo", region, a_3, row + 1)?;
         // Assign `spread_a_hi` and copy constraint
-        self.assign_and_constrain(region, || "spread_a_hi", a_4, row + 1, word.a_hi.spread)?;
+        word.a_hi
+            .spread
+            .copy_advice(|| "spread_a_hi", region, a_4, row + 1)?;
         // Assign `spread_b_lo` and copy constraint
-        self.assign_and_constrain(region, || "spread_b_lo", a_3, row - 1, word.b_lo.spread)?;
+        word.b_lo
+            .spread
+            .copy_advice(|| "spread_b_lo", region, a_3, row - 1)?;
         // Assign `spread_b_hi` and copy constraint
-        self.assign_and_constrain(region, || "spread_b_hi", a_4, row - 1, word.b_hi.spread)?;
+        word.b_hi
+            .spread
+            .copy_advice(|| "spread_b_hi", region, a_4, row - 1)?;
         // Assign `spread_c` and copy constraint
-        self.assign_and_constrain(region, || "spread_c", a_5, row, word.c.spread)?;
+        word.c.spread.copy_advice(|| "spread_c", region, a_5, row)?;
         // Assign `spread_d` and copy constraint
-        self.assign_and_constrain(region, || "spread_d", a_4, row, word.d.spread)?;
+        word.d.spread.copy_advice(|| "spread_d", region, a_4, row)?;
 
         // Calculate R_0^{even}, R_0^{odd}, R_1^{even}, R_1^{odd}
-        let (r_0_even, r_0_odd, r_1_even, r_1_odd) = if word.a_lo.spread.value.is_some() {
-            let spread_a_lo = word.a_lo.spread.value.unwrap() as u64;
-            let spread_a_hi = word.a_hi.spread.value.unwrap() as u64;
-            let spread_b_lo = word.b_lo.spread.value.unwrap() as u64;
-            let spread_b_hi = word.b_hi.spread.value.unwrap() as u64;
-            let spread_c = word.c.spread.value.unwrap() as u64;
-            let spread_d = word.d.spread.value.unwrap() as u64;
+        // Calculate R_0^{even}, R_0^{odd}, R_1^{even}, R_1^{odd}
+        let r = word.xor_upper_sigma();
+        let r_0: Value<[bool; 32]> = r.map(|r| r[..32].try_into().unwrap());
+        let r_0_even = r_0.map(even_bits);
+        let r_0_odd = r_0.map(odd_bits);
 
-            let xor_0 = spread_b_lo
-                + (1 << 4) * spread_b_hi
-                + (1 << 10) * spread_c
-                + (1 << 38) * spread_d
-                + (1 << 52) * spread_a_lo
-                + (1 << 58) * spread_a_hi;
-            let xor_1 = spread_c
-                + (1 << 28) * spread_d
-                + (1 << 42) * spread_a_lo
-                + (1 << 48) * spread_a_hi
-                + (1 << 54) * spread_b_lo
-                + (1 << 58) * spread_b_hi;
-            let xor_2 = spread_d
-                + (1 << 14) * spread_a_lo
-                + (1 << 20) * spread_a_hi
-                + (1 << 26) * spread_b_lo
-                + (1 << 30) * spread_b_hi
-                + (1 << 36) * spread_c;
-            let r = xor_0 + xor_1 + xor_2;
-            let r_pieces = chop_u64(r, &[32, 32]); // r_0, r_1
-            let (r_0_even, r_0_odd) = get_even_and_odd_bits_u32(r_pieces[0] as u32);
-            let (r_1_even, r_1_odd) = get_even_and_odd_bits_u32(r_pieces[1] as u32);
-
-            (Some(r_0_even), Some(r_0_odd), Some(r_1_even), Some(r_1_odd))
-        } else {
-            (None, None, None, None)
-        };
+        let r_1: Value<[bool; 32]> = r.map(|r| r[32..].try_into().unwrap());
+        let r_1_even = r_1.map(even_bits);
+        let r_1_odd = r_1.map(odd_bits);
 
         self.assign_sigma_outputs(
             region,
@@ -452,11 +488,11 @@ impl CompressionConfig {
         &self,
         region: &mut Region<'_, F>,
         row: usize,
-        r_0_even: Option<u16>,
-        r_0_odd: Option<u16>,
-        r_1_even: Option<u16>,
-        r_1_odd: Option<u16>,
-    ) -> Result<(CellValue16, CellValue16), Error> {
+        r_0_even: Value<[bool; 16]>,
+        r_0_odd: Value<[bool; 16]>,
+        r_1_even: Value<[bool; 16]>,
+        r_1_odd: Value<[bool; 16]>,
+    ) -> Result<(AssignedBits<16, F>, AssignedBits<16, F>), Error> {
         let a_3 = self.extras[0];
 
         let (_even, odd) = self.assign_spread_outputs(
@@ -476,125 +512,137 @@ impl CompressionConfig {
     pub(super) fn assign_ch<F: FieldExt>(
         &self,
         region: &mut Region<'_, F>,
-        idx: i32,
-        spread_halves_e: (CellValue32, CellValue32),
-        spread_halves_f: (CellValue32, CellValue32),
-    ) -> Result<(CellValue16, CellValue16), Error> {
+        round_idx: MainRoundIdx,
+        spread_halves_e: RoundWordSpread<F>,
+        spread_halves_f: RoundWordSpread<F>,
+    ) -> Result<(AssignedBits<16, F>, AssignedBits<16, F>), Error> {
         let a_3 = self.extras[0];
         let a_4 = self.extras[1];
 
-        let row = get_ch_row(idx);
+        let row = get_ch_row(round_idx);
 
-        region.assign_fixed(|| "s_ch", self.s_ch, row, || Ok(F::one()))?;
+        self.s_ch.enable(region, row)?;
 
         // Assign and copy spread_e_lo, spread_e_hi
-        self.assign_and_constrain(region, || "spread_e_lo", a_3, row - 1, spread_halves_e.0)?;
-        self.assign_and_constrain(region, || "spread_e_hi", a_4, row - 1, spread_halves_e.1)?;
+        spread_halves_e
+            .0
+            .copy_advice(|| "spread_e_lo", region, a_3, row - 1)?;
+        spread_halves_e
+            .1
+            .copy_advice(|| "spread_e_hi", region, a_4, row - 1)?;
 
         // Assign and copy spread_f_lo, spread_f_hi
-        self.assign_and_constrain(region, || "spread_f_lo", a_3, row + 1, spread_halves_f.0)?;
-        self.assign_and_constrain(region, || "spread_f_hi", a_4, row + 1, spread_halves_f.1)?;
+        spread_halves_f
+            .0
+            .copy_advice(|| "spread_f_lo", region, a_3, row + 1)?;
+        spread_halves_f
+            .1
+            .copy_advice(|| "spread_f_hi", region, a_4, row + 1)?;
 
-        let (p0_even, p0_odd, p1_even, p1_odd) = if spread_halves_e.0.value.is_some() {
-            let p: u64 = spread_halves_e.0.value.unwrap() as u64
-                + spread_halves_f.0.value.unwrap() as u64
-                + (1 << 32) * (spread_halves_e.1.value.unwrap() as u64)
-                + (1 << 32) * (spread_halves_f.1.value.unwrap() as u64);
-            let p_pieces = chop_u64(p, &[32, 32]); // p_0, p_1
+        let p: Value<[bool; 64]> = spread_halves_e
+            .value()
+            .zip(spread_halves_f.value())
+            .map(|(e, f)| i2lebsp(e + f));
 
-            let (p0_even, p0_odd) = get_even_and_odd_bits_u32(p_pieces[0] as u32);
-            let (p1_even, p1_odd) = get_even_and_odd_bits_u32(p_pieces[1] as u32);
+        let p_0: Value<[bool; 32]> = p.map(|p| p[..32].try_into().unwrap());
+        let p_0_even = p_0.map(even_bits);
+        let p_0_odd = p_0.map(odd_bits);
 
-            (Some(p0_even), Some(p0_odd), Some(p1_even), Some(p1_odd))
-        } else {
-            (None, None, None, None)
-        };
+        let p_1: Value<[bool; 32]> = p.map(|p| p[32..].try_into().unwrap());
+        let p_1_even = p_1.map(even_bits);
+        let p_1_odd = p_1.map(odd_bits);
 
-        self.assign_ch_outputs(region, row, p0_even, p0_odd, p1_even, p1_odd)
+        self.assign_ch_outputs(region, row, p_0_even, p_0_odd, p_1_even, p_1_odd)
     }
 
     pub(super) fn assign_ch_neg<F: FieldExt>(
         &self,
         region: &mut Region<'_, F>,
-        idx: i32,
-        spread_halves_e: (CellValue32, CellValue32),
-        spread_halves_g: (CellValue32, CellValue32),
-    ) -> Result<(CellValue16, CellValue16), Error> {
-        let row = get_ch_neg_row(idx);
+        round_idx: MainRoundIdx,
+        spread_halves_e: RoundWordSpread<F>,
+        spread_halves_g: RoundWordSpread<F>,
+    ) -> Result<(AssignedBits<16, F>, AssignedBits<16, F>), Error> {
+        let row = get_ch_neg_row(round_idx);
 
-        region.assign_fixed(|| "s_ch_neg", self.s_ch_neg, row, || Ok(F::one()))?;
+        self.s_ch_neg.enable(region, row)?;
 
         let a_3 = self.extras[0];
         let a_4 = self.extras[1];
         let a_5 = self.message_schedule;
 
         // Assign and copy spread_e_lo, spread_e_hi
-        self.assign_and_constrain(region, || "spread_e_lo", a_5, row - 1, spread_halves_e.0)?;
-        self.assign_and_constrain(region, || "spread_e_hi", a_5, row, spread_halves_e.1)?;
+        spread_halves_e
+            .0
+            .copy_advice(|| "spread_e_lo", region, a_5, row - 1)?;
+        spread_halves_e
+            .1
+            .copy_advice(|| "spread_e_hi", region, a_5, row)?;
 
         // Assign and copy spread_g_lo, spread_g_hi
-        self.assign_and_constrain(region, || "spread_g_lo", a_3, row + 1, spread_halves_g.0)?;
-        self.assign_and_constrain(region, || "spread_g_hi", a_4, row + 1, spread_halves_g.1)?;
+        spread_halves_g
+            .0
+            .copy_advice(|| "spread_g_lo", region, a_3, row + 1)?;
+        spread_halves_g
+            .1
+            .copy_advice(|| "spread_g_hi", region, a_4, row + 1)?;
 
-        // Calculate neg_e_lo, neg_e_hi
+        // Calculate neg_e_lo
         let spread_neg_e_lo = spread_halves_e
             .0
-            .value
-            .map(|spread_e_lo| (MASK_EVEN_32 - spread_e_lo) as u64);
-        let spread_neg_e_hi = spread_halves_e
-            .1
-            .value
-            .map(|spread_e_hi| (MASK_EVEN_32 - spread_e_hi) as u64);
-
-        // Assign spread_neg_e_lo, spread_neg_e_hi
-        region.assign_advice(
+            .value()
+            .map(|spread_e_lo| negate_spread(spread_e_lo.0));
+        // Assign spread_neg_e_lo
+        AssignedBits::<32, F>::assign_bits(
+            region,
             || "spread_neg_e_lo",
             a_3,
             row - 1,
-            || {
-                spread_neg_e_lo
-                    .map(F::from_u64)
-                    .ok_or(Error::SynthesisError)
-            },
+            spread_neg_e_lo,
         )?;
-        region.assign_advice(
+
+        // Calculate neg_e_hi
+        let spread_neg_e_hi = spread_halves_e
+            .1
+            .value()
+            .map(|spread_e_hi| negate_spread(spread_e_hi.0));
+        // Assign spread_neg_e_hi
+        AssignedBits::<32, F>::assign_bits(
+            region,
             || "spread_neg_e_hi",
             a_4,
             row - 1,
-            || {
-                spread_neg_e_hi
-                    .map(F::from_u64)
-                    .ok_or(Error::SynthesisError)
-            },
+            spread_neg_e_hi,
         )?;
 
-        let (p0_even, p0_odd, p1_even, p1_odd) = if let Some(spread_neg_e_lo) = spread_neg_e_lo {
-            let p: u64 = spread_neg_e_lo as u64
-                + spread_halves_g.0.value.unwrap() as u64
-                + (1 << 32) * spread_neg_e_hi.unwrap() as u64
-                + (1 << 32) * (spread_halves_g.1.value.unwrap() as u64);
-            let p_pieces = chop_u64(p, &[32, 32]); // p_0, p_1
-
-            let (p0_even, p0_odd) = get_even_and_odd_bits_u32(p_pieces[0] as u32);
-            let (p1_even, p1_odd) = get_even_and_odd_bits_u32(p_pieces[1] as u32);
-
-            (Some(p0_even), Some(p0_odd), Some(p1_even), Some(p1_odd))
-        } else {
-            (None, None, None, None)
+        let p: Value<[bool; 64]> = {
+            let spread_neg_e = spread_neg_e_lo
+                .zip(spread_neg_e_hi)
+                .map(|(lo, hi)| lebs2ip(&lo) + (1 << 32) * lebs2ip(&hi));
+            spread_neg_e
+                .zip(spread_halves_g.value())
+                .map(|(neg_e, g)| i2lebsp(neg_e + g))
         };
 
-        self.assign_ch_outputs(region, row, p0_even, p0_odd, p1_even, p1_odd)
+        let p_0: Value<[bool; 32]> = p.map(|p| p[..32].try_into().unwrap());
+        let p_0_even = p_0.map(even_bits);
+        let p_0_odd = p_0.map(odd_bits);
+
+        let p_1: Value<[bool; 32]> = p.map(|p| p[32..].try_into().unwrap());
+        let p_1_even = p_1.map(even_bits);
+        let p_1_odd = p_1.map(odd_bits);
+
+        self.assign_ch_outputs(region, row, p_0_even, p_0_odd, p_1_even, p_1_odd)
     }
 
     fn assign_maj_outputs<F: FieldExt>(
         &self,
         region: &mut Region<'_, F>,
         row: usize,
-        r_0_even: Option<u16>,
-        r_0_odd: Option<u16>,
-        r_1_even: Option<u16>,
-        r_1_odd: Option<u16>,
-    ) -> Result<(CellValue16, CellValue16), Error> {
+        r_0_even: Value<[bool; 16]>,
+        r_0_odd: Value<[bool; 16]>,
+        r_1_even: Value<[bool; 16]>,
+        r_1_odd: Value<[bool; 16]>,
+    ) -> Result<(AssignedBits<16, F>, AssignedBits<16, F>), Error> {
         let a_3 = self.extras[0];
         let (_even, odd) = self.assign_spread_outputs(
             region,
@@ -613,48 +661,57 @@ impl CompressionConfig {
     pub(super) fn assign_maj<F: FieldExt>(
         &self,
         region: &mut Region<'_, F>,
-        idx: i32,
-        spread_halves_a: (CellValue32, CellValue32),
-        spread_halves_b: (CellValue32, CellValue32),
-        spread_halves_c: (CellValue32, CellValue32),
-    ) -> Result<(CellValue16, CellValue16), Error> {
+        round_idx: MainRoundIdx,
+        spread_halves_a: RoundWordSpread<F>,
+        spread_halves_b: RoundWordSpread<F>,
+        spread_halves_c: RoundWordSpread<F>,
+    ) -> Result<(AssignedBits<16, F>, AssignedBits<16, F>), Error> {
         let a_4 = self.extras[1];
         let a_5 = self.message_schedule;
 
-        let row = get_maj_row(idx);
+        let row = get_maj_row(round_idx);
 
-        region.assign_fixed(|| "s_maj", self.s_maj, row, || Ok(F::one()))?;
+        self.s_maj.enable(region, row)?;
 
         // Assign and copy spread_a_lo, spread_a_hi
-        self.assign_and_constrain(region, || "spread_a_lo", a_4, row - 1, spread_halves_a.0)?;
-        self.assign_and_constrain(region, || "spread_a_hi", a_5, row - 1, spread_halves_a.1)?;
+        spread_halves_a
+            .0
+            .copy_advice(|| "spread_a_lo", region, a_4, row - 1)?;
+        spread_halves_a
+            .1
+            .copy_advice(|| "spread_a_hi", region, a_5, row - 1)?;
 
         // Assign and copy spread_b_lo, spread_b_hi
-        self.assign_and_constrain(region, || "spread_b_lo", a_4, row, spread_halves_b.0)?;
-        self.assign_and_constrain(region, || "spread_b_hi", a_5, row, spread_halves_b.1)?;
+        spread_halves_b
+            .0
+            .copy_advice(|| "spread_b_lo", region, a_4, row)?;
+        spread_halves_b
+            .1
+            .copy_advice(|| "spread_b_hi", region, a_5, row)?;
 
         // Assign and copy spread_c_lo, spread_c_hi
-        self.assign_and_constrain(region, || "spread_c_lo", a_4, row + 1, spread_halves_c.0)?;
-        self.assign_and_constrain(region, || "spread_c_hi", a_5, row + 1, spread_halves_c.1)?;
+        spread_halves_c
+            .0
+            .copy_advice(|| "spread_c_lo", region, a_4, row + 1)?;
+        spread_halves_c
+            .1
+            .copy_advice(|| "spread_c_hi", region, a_5, row + 1)?;
 
-        let (m0_even, m0_odd, m1_even, m1_odd) = if spread_halves_a.0.value.is_some() {
-            let m: u64 = spread_halves_a.0.value.unwrap() as u64
-                + spread_halves_b.0.value.unwrap() as u64
-                + spread_halves_c.0.value.unwrap() as u64
-                + (1 << 32) * (spread_halves_a.1.value.unwrap() as u64)
-                + (1 << 32) * (spread_halves_b.1.value.unwrap() as u64)
-                + (1 << 32) * (spread_halves_c.1.value.unwrap() as u64);
-            let m_pieces = chop_u64(m, &[32, 32]); // m_0, m_1
+        let m: Value<[bool; 64]> = spread_halves_a
+            .value()
+            .zip(spread_halves_b.value())
+            .zip(spread_halves_c.value())
+            .map(|((a, b), c)| i2lebsp(a + b + c));
 
-            let (m0_even, m0_odd) = get_even_and_odd_bits_u32(m_pieces[0] as u32);
-            let (m1_even, m1_odd) = get_even_and_odd_bits_u32(m_pieces[1] as u32);
+        let m_0: Value<[bool; 32]> = m.map(|m| m[..32].try_into().unwrap());
+        let m_0_even = m_0.map(even_bits);
+        let m_0_odd = m_0.map(odd_bits);
 
-            (Some(m0_even), Some(m0_odd), Some(m1_even), Some(m1_odd))
-        } else {
-            (None, None, None, None)
-        };
+        let m_1: Value<[bool; 32]> = m.map(|m| m[32..].try_into().unwrap());
+        let m_1_even = m_1.map(even_bits);
+        let m_1_odd = m_1.map(odd_bits);
 
-        self.assign_maj_outputs(region, row, m0_even, m0_odd, m1_even, m1_odd)
+        self.assign_maj_outputs(region, row, m_0_even, m_0_odd, m_1_even, m_1_odd)
     }
 
     // s_h_prime to get H' = H + Ch(E, F, G) + s_upper_sigma_1(E) + K + W
@@ -662,16 +719,16 @@ impl CompressionConfig {
     pub(super) fn assign_h_prime<F: FieldExt>(
         &self,
         region: &mut Region<'_, F>,
-        idx: i32,
-        h: (CellValue16, CellValue16),
-        ch: (CellValue16, CellValue16),
-        ch_neg: (CellValue16, CellValue16),
-        sigma_1: (CellValue16, CellValue16),
+        round_idx: MainRoundIdx,
+        h: RoundWordDense<F>,
+        ch: (AssignedBits<16, F>, AssignedBits<16, F>),
+        ch_neg: (AssignedBits<16, F>, AssignedBits<16, F>),
+        sigma_1: (AssignedBits<16, F>, AssignedBits<16, F>),
         k: u32,
-        w: (CellValue16, CellValue16),
-    ) -> Result<(CellValue16, CellValue16), Error> {
-        let row = get_h_prime_row(idx);
-        region.assign_fixed(|| "s_h_prime", self.s_h_prime, row, || Ok(F::one()))?;
+        w: &(AssignedBits<16, F>, AssignedBits<16, F>),
+    ) -> Result<RoundWordDense<F>, Error> {
+        let row = get_h_prime_row(round_idx);
+        self.s_h_prime.enable(region, row)?;
 
         let a_4 = self.extras[1];
         let a_5 = self.message_schedule;
@@ -681,123 +738,111 @@ impl CompressionConfig {
         let a_9 = self.extras[5];
 
         // Assign and copy h
-        self.assign_and_constrain(region, || "h_lo", a_7, row - 1, h.0)?;
-        self.assign_and_constrain(region, || "h_hi", a_7, row, h.1)?;
+        h.0.copy_advice(|| "h_lo", region, a_7, row - 1)?;
+        h.1.copy_advice(|| "h_hi", region, a_7, row)?;
 
         // Assign and copy sigma_1
-        self.assign_and_constrain(region, || "sigma_1_lo", a_4, row, sigma_1.0)?;
-        self.assign_and_constrain(region, || "sigma_1_hi", a_5, row, sigma_1.1)?;
+        sigma_1.0.copy_advice(|| "sigma_1_lo", region, a_4, row)?;
+        sigma_1.1.copy_advice(|| "sigma_1_hi", region, a_5, row)?;
 
         // Assign k
-        let k_pieces = chop_u32(k, &[16, 16]);
-        region.assign_advice(
-            || "k_lo",
-            a_6,
-            row - 1,
-            || Ok(F::from_u64(k_pieces[0] as u64)),
-        )?;
-        region.assign_advice(|| "k_hi", a_6, row, || Ok(F::from_u64(k_pieces[1] as u64)))?;
+        let k: [bool; 32] = i2lebsp(k.into());
+        let k_lo: [bool; 16] = k[..16].try_into().unwrap();
+        let k_hi: [bool; 16] = k[16..].try_into().unwrap();
+        {
+            AssignedBits::<16, F>::assign_bits(
+                region,
+                || "k_lo",
+                a_6,
+                row - 1,
+                Value::known(k_lo),
+            )?;
+            AssignedBits::<16, F>::assign_bits(region, || "k_hi", a_6, row, Value::known(k_hi))?;
+        }
 
         // Assign and copy w
-        self.assign_and_constrain(region, || "w_lo", a_8, row - 1, w.0)?;
-        self.assign_and_constrain(region, || "w_hi", a_8, row, w.1)?;
+        w.0.copy_advice(|| "w_lo", region, a_8, row - 1)?;
+        w.1.copy_advice(|| "w_hi", region, a_8, row)?;
 
         // Assign and copy ch
-        self.assign_and_constrain(region, || "ch_neg_hi", a_6, row + 1, ch.1)?;
+        ch.1.copy_advice(|| "ch_neg_hi", region, a_6, row + 1)?;
 
         // Assign and copy ch_neg
-        self.assign_and_constrain(region, || "ch_neg_lo", a_5, row - 1, ch_neg.0)?;
-        self.assign_and_constrain(region, || "ch_neg_hi", a_5, row + 1, ch_neg.1)?;
+        ch_neg.0.copy_advice(|| "ch_neg_lo", region, a_5, row - 1)?;
+        ch_neg.1.copy_advice(|| "ch_neg_hi", region, a_5, row + 1)?;
 
         // Assign h_prime_lo, h_prime_hi, h_prime_carry
-        let (h_prime, h_prime_carry) = sum_with_carry(vec![
-            (h.0.value, h.1.value),
-            (ch.0.value, ch.1.value),
-            (ch_neg.0.value, ch_neg.1.value),
-            (sigma_1.0.value, sigma_1.1.value),
-            (Some(k_pieces[0] as u16), Some(k_pieces[1] as u16)),
-            (w.0.value, w.1.value),
-        ]);
-        let h_prime_halves = h_prime.map(|h_prime| chop_u32(h_prime as u32, &[16, 16]));
-        let (h_prime_lo, h_prime_hi) = (
-            h_prime_halves.clone().map(|halves| halves[0] as u16),
-            h_prime_halves.map(|halves| halves[1] as u16),
-        );
+        {
+            let (h_prime, h_prime_carry) = sum_with_carry(vec![
+                (h.0.value_u16(), h.1.value_u16()),
+                (ch.0.value_u16(), ch.1.value_u16()),
+                (ch_neg.0.value_u16(), ch_neg.1.value_u16()),
+                (sigma_1.0.value_u16(), sigma_1.1.value_u16()),
+                (
+                    Value::known(lebs2ip(&k_lo) as u16),
+                    Value::known(lebs2ip(&k_hi) as u16),
+                ),
+                (w.0.value_u16(), w.1.value_u16()),
+            ]);
 
-        let h_prime_lo = {
-            let cell = region.assign_advice(
+            region.assign_advice(
+                || "h_prime_carry",
+                a_9,
+                row + 1,
+                || h_prime_carry.map(|value| F::from(value as u64)),
+            )?;
+
+            let h_prime: Value<[bool; 32]> = h_prime.map(|w| i2lebsp(w.into()));
+            let h_prime_lo: Value<[bool; 16]> = h_prime.map(|w| w[..16].try_into().unwrap());
+            let h_prime_hi: Value<[bool; 16]> = h_prime.map(|w| w[16..].try_into().unwrap());
+
+            let h_prime_lo = AssignedBits::<16, F>::assign_bits(
+                region,
                 || "h_prime_lo",
                 a_7,
                 row + 1,
-                || {
-                    h_prime_lo
-                        .map(|value| F::from_u64(value as u64))
-                        .ok_or(Error::SynthesisError)
-                },
+                h_prime_lo,
             )?;
-            CellValue16::new(cell, h_prime_lo)
-        };
-        let h_prime_hi = {
-            let cell = region.assign_advice(
+            let h_prime_hi = AssignedBits::<16, F>::assign_bits(
+                region,
                 || "h_prime_hi",
                 a_8,
                 row + 1,
-                || {
-                    h_prime_hi
-                        .map(|value| F::from_u64(value as u64))
-                        .ok_or(Error::SynthesisError)
-                },
+                h_prime_hi,
             )?;
-            CellValue16::new(cell, h_prime_hi)
-        };
 
-        region.assign_advice(
-            || "h_prime_carry",
-            a_9,
-            row + 1,
-            || {
-                h_prime_carry
-                    .map(|value| F::from_u64(value as u64))
-                    .ok_or(Error::SynthesisError)
-            },
-        )?;
-
-        Ok((h_prime_lo, h_prime_hi))
+            Ok((h_prime_lo, h_prime_hi).into())
+        }
     }
 
     // s_e_new to get E_new = H' + D
     pub(super) fn assign_e_new<F: FieldExt>(
         &self,
         region: &mut Region<'_, F>,
-        idx: i32,
-        d: (CellValue16, CellValue16),
-        h_prime: (CellValue16, CellValue16),
-    ) -> Result<(CellValue16, CellValue16), Error> {
-        let row = get_e_new_row(idx);
+        round_idx: MainRoundIdx,
+        d: &RoundWordDense<F>,
+        h_prime: &RoundWordDense<F>,
+    ) -> Result<RoundWordDense<F>, Error> {
+        let row = get_e_new_row(round_idx);
 
-        region.assign_fixed(|| "s_e_new", self.s_e_new, row, || Ok(F::one()))?;
+        self.s_e_new.enable(region, row)?;
 
         let a_7 = self.extras[3];
         let a_8 = self.extras[4];
         let a_9 = self.extras[5];
 
         // Assign and copy d_lo, d_hi
-        self.assign_and_constrain(region, || "d_lo", a_7, row, d.0)?;
-        self.assign_and_constrain(region, || "d_hi", a_7, row + 1, d.1)?;
+        d.0.copy_advice(|| "d_lo", region, a_7, row)?;
+        d.1.copy_advice(|| "d_hi", region, a_7, row + 1)?;
 
         // Assign e_new, e_new_carry
         let (e_new, e_new_carry) = sum_with_carry(vec![
-            (h_prime.0.value, h_prime.1.value),
-            (d.0.value, d.1.value),
+            (h_prime.0.value_u16(), h_prime.1.value_u16()),
+            (d.0.value_u16(), d.1.value_u16()),
         ]);
 
         let e_new_dense = self.assign_word_halves_dense(region, row, a_8, row + 1, a_8, e_new)?;
-        region.assign_advice(
-            || "e_new_carry",
-            a_9,
-            row + 1,
-            || e_new_carry.map(F::from_u64).ok_or(Error::SynthesisError),
-        )?;
+        region.assign_advice(|| "e_new_carry", a_9, row + 1, || e_new_carry.map(F::from))?;
 
         Ok(e_new_dense)
     }
@@ -806,14 +851,14 @@ impl CompressionConfig {
     pub(super) fn assign_a_new<F: FieldExt>(
         &self,
         region: &mut Region<'_, F>,
-        idx: i32,
-        maj: (CellValue16, CellValue16),
-        sigma_0: (CellValue16, CellValue16),
-        h_prime: (CellValue16, CellValue16),
-    ) -> Result<(CellValue16, CellValue16), Error> {
-        let row = get_a_new_row(idx);
+        round_idx: MainRoundIdx,
+        maj: (AssignedBits<16, F>, AssignedBits<16, F>),
+        sigma_0: (AssignedBits<16, F>, AssignedBits<16, F>),
+        h_prime: RoundWordDense<F>,
+    ) -> Result<RoundWordDense<F>, Error> {
+        let row = get_a_new_row(round_idx);
 
-        region.assign_fixed(|| "s_a_new", self.s_a_new, row, || Ok(F::one()))?;
+        self.s_a_new.enable(region, row)?;
 
         let a_3 = self.extras[0];
         let a_6 = self.extras[2];
@@ -822,30 +867,31 @@ impl CompressionConfig {
         let a_9 = self.extras[5];
 
         // Assign and copy maj_1
-        self.assign_and_constrain(region, || "maj_1_hi", a_3, row - 1, maj.1)?;
+        maj.1.copy_advice(|| "maj_1_hi", region, a_3, row - 1)?;
 
         // Assign and copy sigma_0
-        self.assign_and_constrain(region, || "sigma_0_lo", a_6, row, sigma_0.0)?;
-        self.assign_and_constrain(region, || "sigma_0_hi", a_6, row + 1, sigma_0.1)?;
+        sigma_0.0.copy_advice(|| "sigma_0_lo", region, a_6, row)?;
+        sigma_0
+            .1
+            .copy_advice(|| "sigma_0_hi", region, a_6, row + 1)?;
 
         // Assign and copy h_prime
-        self.assign_and_constrain(region, || "h_prime_lo", a_7, row - 1, h_prime.0)?;
-        self.assign_and_constrain(region, || "h_prime_hi", a_8, row - 1, h_prime.1)?;
+        h_prime
+            .0
+            .copy_advice(|| "h_prime_lo", region, a_7, row - 1)?;
+        h_prime
+            .1
+            .copy_advice(|| "h_prime_hi", region, a_8, row - 1)?;
 
         // Assign a_new, a_new_carry
         let (a_new, a_new_carry) = sum_with_carry(vec![
-            (h_prime.0.value, h_prime.1.value),
-            (sigma_0.0.value, sigma_0.1.value),
-            (maj.0.value, maj.1.value),
+            (h_prime.0.value_u16(), h_prime.1.value_u16()),
+            (sigma_0.0.value_u16(), sigma_0.1.value_u16()),
+            (maj.0.value_u16(), maj.1.value_u16()),
         ]);
 
         let a_new_dense = self.assign_word_halves_dense(region, row, a_8, row + 1, a_8, a_new)?;
-        region.assign_advice(
-            || "a_new_carry",
-            a_9,
-            row,
-            || a_new_carry.map(F::from_u64).ok_or(Error::SynthesisError),
-        )?;
+        region.assign_advice(|| "a_new_carry", a_9, row, || a_new_carry.map(F::from))?;
 
         Ok(a_new_dense)
     }
@@ -857,40 +903,21 @@ impl CompressionConfig {
         lo_col: Column<Advice>,
         hi_row: usize,
         hi_col: Column<Advice>,
-        word: Option<u32>,
-    ) -> Result<(CellValue16, CellValue16), Error> {
-        let (lo, hi) = if let Some(word) = word {
-            let halves = chop_u32(word, &[16, 16]);
-            (Some(halves[0] as u16), Some(halves[1] as u16))
-        } else {
-            (None, None)
-        };
+        word: Value<u32>,
+    ) -> Result<RoundWordDense<F>, Error> {
+        let word: Value<[bool; 32]> = word.map(|w| i2lebsp(w.into()));
+
         let lo = {
-            let cell = region.assign_advice(
-                || "lo",
-                lo_col,
-                lo_row,
-                || {
-                    lo.map(|lo| F::from_u64(lo as u64))
-                        .ok_or(Error::SynthesisError)
-                },
-            )?;
-            CellValue16::new(cell, lo)
-        };
-        let hi = {
-            let cell = region.assign_advice(
-                || "hi",
-                hi_col,
-                hi_row,
-                || {
-                    hi.map(|hi| F::from_u64(hi as u64))
-                        .ok_or(Error::SynthesisError)
-                },
-            )?;
-            CellValue16::new(cell, hi)
+            let lo: Value<[bool; 16]> = word.map(|w| w[..16].try_into().unwrap());
+            AssignedBits::<16, F>::assign_bits(region, || "lo", lo_col, lo_row, lo)?
         };
 
-        Ok((lo, hi))
+        let hi = {
+            let hi: Value<[bool; 16]> = word.map(|w| w[16..].try_into().unwrap());
+            AssignedBits::<16, F>::assign_bits(region, || "hi", hi_col, hi_row, hi)?
+        };
+
+        Ok((lo, hi).into())
     }
 
     // Assign hi and lo halves for both dense and spread versions of a word
@@ -899,49 +926,39 @@ impl CompressionConfig {
         &self,
         region: &mut Region<'_, F>,
         row: usize,
-        word: Option<u32>,
-    ) -> Result<((CellValue16, CellValue16), (CellValue32, CellValue32)), Error> {
+        word: Value<u32>,
+    ) -> Result<(RoundWordDense<F>, RoundWordSpread<F>), Error> {
         // Rename these here for ease of matching the gates to the specification.
         let a_7 = self.extras[3];
         let a_8 = self.extras[4];
 
-        let halves = word.map(|word| chop_u32(word, &[16, 16]));
-        let halves = transpose_option_vec(halves, 2);
-        let w_lo = SpreadWord::opt_new(halves[0].map(|value| value as u16));
-        let w_hi = SpreadWord::opt_new(halves[1].map(|value| value as u16));
+        let word: Value<[bool; 32]> = word.map(|w| i2lebsp(w.into()));
+        let lo: Value<[bool; 16]> = word.map(|w| w[..16].try_into().unwrap());
+        let hi: Value<[bool; 16]> = word.map(|w| w[16..].try_into().unwrap());
 
-        let w_lo = SpreadVar::without_lookup(region, a_7, row, a_8, row, w_lo)?;
-        let w_hi = SpreadVar::without_lookup(region, a_7, row + 1, a_8, row + 1, w_hi)?;
+        let w_lo = SpreadVar::without_lookup(region, a_7, row, a_8, row, lo.map(SpreadWord::new))?;
+        let w_hi =
+            SpreadVar::without_lookup(region, a_7, row + 1, a_8, row + 1, hi.map(SpreadWord::new))?;
 
-        let w_lo_cell = CellValue16::new(w_lo.dense.var, w_lo.dense.value);
-        let w_hi_cell = CellValue16::new(w_hi.dense.var, w_hi.dense.value);
-        let spread_w_lo_cell = CellValue32::new(w_lo.spread.var, w_lo.spread.value);
-        let spread_w_hi_cell = CellValue32::new(w_hi.spread.var, w_hi.spread.value);
-
-        Ok(((w_lo_cell, w_hi_cell), (spread_w_lo_cell, spread_w_hi_cell)))
+        Ok((
+            (w_lo.dense, w_hi.dense).into(),
+            (w_lo.spread, w_hi.spread).into(),
+        ))
     }
 }
 
-pub fn val_from_dense_halves(dense_halves: (CellValue16, CellValue16)) -> Option<u32> {
-    dense_halves
-        .0
-        .value
-        .zip(dense_halves.1.value)
-        .map(|(lo, hi)| lo as u32 + (1 << 16) * hi as u32)
-}
-
 #[allow(clippy::many_single_char_names)]
-pub fn match_state(
-    state: State,
+pub fn match_state<F: FieldExt>(
+    state: State<F>,
 ) -> (
-    RoundWordA,
-    RoundWordSpread,
-    RoundWordSpread,
-    RoundWordDense,
-    RoundWordE,
-    RoundWordSpread,
-    RoundWordSpread,
-    RoundWordDense,
+    RoundWordA<F>,
+    RoundWord<F>,
+    RoundWord<F>,
+    RoundWordDense<F>,
+    RoundWordE<F>,
+    RoundWord<F>,
+    RoundWord<F>,
+    RoundWordDense<F>,
 ) {
     let a = match state.a {
         Some(StateWord::A(a)) => a,

@@ -1,13 +1,18 @@
 use super::{
-    super::DIGEST_SIZE, BlockWord, CellValue16, CellValue32, SpreadInputs, SpreadVar,
-    Table16Assignment, ROUNDS, STATE,
+    super::DIGEST_SIZE,
+    util::{i2lebsp, lebs2ip},
+    AssignedBits, BlockWord, SpreadInputs, SpreadVar, Table16Assignment, ROUNDS, STATE,
 };
-use halo2::{
-    arithmetic::FieldExt,
-    circuit::Layouter,
-    plonk::{Advice, Column, ConstraintSystem, Error, Fixed},
-    poly::Rotation,
+use halo2wrong::{
+    curves::FieldExt,
+    halo2::{
+        circuit::{Layouter, Value},
+        plonk::{Advice, Column, ConstraintSystem, Error, Selector},
+        poly::Rotation,
+    },
 };
+use std::convert::TryInto;
+use std::ops::Range;
 
 mod compression_gates;
 mod compression_util;
@@ -16,6 +21,55 @@ mod subregion_initial;
 mod subregion_main;
 
 use compression_gates::CompressionGate;
+
+pub trait UpperSigmaVar<
+    const A_LEN: usize,
+    const B_LEN: usize,
+    const C_LEN: usize,
+    const D_LEN: usize,
+>
+{
+    fn spread_a(&self) -> Value<[bool; A_LEN]>;
+    fn spread_b(&self) -> Value<[bool; B_LEN]>;
+    fn spread_c(&self) -> Value<[bool; C_LEN]>;
+    fn spread_d(&self) -> Value<[bool; D_LEN]>;
+
+    fn xor_upper_sigma(&self) -> Value<[bool; 64]> {
+        self.spread_a()
+            .zip(self.spread_b())
+            .zip(self.spread_c())
+            .zip(self.spread_d())
+            .map(|(((a, b), c), d)| {
+                let xor_0 = b
+                    .iter()
+                    .chain(c.iter())
+                    .chain(d.iter())
+                    .chain(a.iter())
+                    .copied()
+                    .collect::<Vec<_>>();
+                let xor_1 = c
+                    .iter()
+                    .chain(d.iter())
+                    .chain(a.iter())
+                    .chain(b.iter())
+                    .copied()
+                    .collect::<Vec<_>>();
+                let xor_2 = d
+                    .iter()
+                    .chain(a.iter())
+                    .chain(b.iter())
+                    .chain(c.iter())
+                    .copied()
+                    .collect::<Vec<_>>();
+
+                let xor_0 = lebs2ip::<64>(&xor_0.try_into().unwrap());
+                let xor_1 = lebs2ip::<64>(&xor_1.try_into().unwrap());
+                let xor_2 = lebs2ip::<64>(&xor_2.try_into().unwrap());
+
+                i2lebsp(xor_0 + xor_1 + xor_2)
+            })
+    }
+}
 
 /// A variable that represents the `[A,B,C,D]` words of the SHA-256 internal state.
 ///
@@ -27,16 +81,83 @@ use compression_gates::CompressionGate;
 ///   respectively in each round, we therefore also have the same pieces in earlier rows.
 ///   We align the columns to make it efficient to copy-constrain these forms where they
 ///   are needed.
-#[derive(Copy, Clone, Debug)]
-pub struct AbcdVar {
-    idx: i32,
-    val: Option<u32>,
-    a: SpreadVar,
-    b: SpreadVar,
-    c_lo: SpreadVar,
-    c_mid: SpreadVar,
-    c_hi: SpreadVar,
-    d: SpreadVar,
+#[derive(Clone, Debug)]
+pub struct AbcdVar<F: FieldExt> {
+    a: SpreadVar<2, 4, F>,
+    b: SpreadVar<11, 22, F>,
+    c_lo: SpreadVar<3, 6, F>,
+    c_mid: SpreadVar<3, 6, F>,
+    c_hi: SpreadVar<3, 6, F>,
+    d: SpreadVar<10, 20, F>,
+}
+
+impl<F: FieldExt> AbcdVar<F> {
+    fn a_range() -> Range<usize> {
+        0..2
+    }
+
+    fn b_range() -> Range<usize> {
+        2..13
+    }
+
+    fn c_lo_range() -> Range<usize> {
+        13..16
+    }
+
+    fn c_mid_range() -> Range<usize> {
+        16..19
+    }
+
+    fn c_hi_range() -> Range<usize> {
+        19..22
+    }
+
+    fn d_range() -> Range<usize> {
+        22..32
+    }
+
+    fn pieces(val: u32) -> Vec<Vec<bool>> {
+        let val: [bool; 32] = i2lebsp(val.into());
+        vec![
+            val[Self::a_range()].to_vec(),
+            val[Self::b_range()].to_vec(),
+            val[Self::c_lo_range()].to_vec(),
+            val[Self::c_mid_range()].to_vec(),
+            val[Self::c_hi_range()].to_vec(),
+            val[Self::d_range()].to_vec(),
+        ]
+    }
+}
+
+impl<F: FieldExt> UpperSigmaVar<4, 22, 18, 20> for AbcdVar<F> {
+    fn spread_a(&self) -> Value<[bool; 4]> {
+        self.a.spread.value().map(|v| v.0)
+    }
+
+    fn spread_b(&self) -> Value<[bool; 22]> {
+        self.b.spread.value().map(|v| v.0)
+    }
+
+    fn spread_c(&self) -> Value<[bool; 18]> {
+        self.c_lo
+            .spread
+            .value()
+            .zip(self.c_mid.spread.value())
+            .zip(self.c_hi.spread.value())
+            .map(|((c_lo, c_mid), c_hi)| {
+                c_lo.iter()
+                    .chain(c_mid.iter())
+                    .chain(c_hi.iter())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap()
+            })
+    }
+
+    fn spread_d(&self) -> Value<[bool; 20]> {
+        self.d.spread.value().map(|v| v.0)
+    }
 }
 
 /// A variable that represents the `[E,F,G,H]` words of the SHA-256 internal state.
@@ -49,151 +170,228 @@ pub struct AbcdVar {
 ///   respectively in each round, we therefore also have the same pieces in earlier rows.
 ///   We align the columns to make it efficient to copy-constrain these forms where they
 ///   are needed.
-#[derive(Copy, Clone, Debug)]
-pub struct EfghVar {
-    idx: i32,
-    val: Option<u32>,
-    a_lo: SpreadVar,
-    a_hi: SpreadVar,
-    b_lo: SpreadVar,
-    b_hi: SpreadVar,
-    c: SpreadVar,
-    d: SpreadVar,
-}
-
 #[derive(Clone, Debug)]
-pub struct RoundWordDense {
-    dense_halves: (CellValue16, CellValue16),
+pub struct EfghVar<F: FieldExt> {
+    a_lo: SpreadVar<3, 6, F>,
+    a_hi: SpreadVar<3, 6, F>,
+    b_lo: SpreadVar<2, 4, F>,
+    b_hi: SpreadVar<3, 6, F>,
+    c: SpreadVar<14, 28, F>,
+    d: SpreadVar<7, 14, F>,
 }
 
-impl RoundWordDense {
-    pub fn new(dense_halves: (CellValue16, CellValue16)) -> Self {
-        RoundWordDense { dense_halves }
+impl<F: FieldExt> EfghVar<F> {
+    fn a_lo_range() -> Range<usize> {
+        0..3
+    }
+
+    fn a_hi_range() -> Range<usize> {
+        3..6
+    }
+
+    fn b_lo_range() -> Range<usize> {
+        6..8
+    }
+
+    fn b_hi_range() -> Range<usize> {
+        8..11
+    }
+
+    fn c_range() -> Range<usize> {
+        11..25
+    }
+
+    fn d_range() -> Range<usize> {
+        25..32
+    }
+
+    fn pieces(val: u32) -> Vec<Vec<bool>> {
+        let val: [bool; 32] = i2lebsp(val.into());
+        vec![
+            val[Self::a_lo_range()].to_vec(),
+            val[Self::a_hi_range()].to_vec(),
+            val[Self::b_lo_range()].to_vec(),
+            val[Self::b_hi_range()].to_vec(),
+            val[Self::c_range()].to_vec(),
+            val[Self::d_range()].to_vec(),
+        ]
+    }
+}
+
+impl<F: FieldExt> UpperSigmaVar<12, 10, 28, 14> for EfghVar<F> {
+    fn spread_a(&self) -> Value<[bool; 12]> {
+        self.a_lo
+            .spread
+            .value()
+            .zip(self.a_hi.spread.value())
+            .map(|(a_lo, a_hi)| {
+                a_lo.iter()
+                    .chain(a_hi.iter())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap()
+            })
+    }
+
+    fn spread_b(&self) -> Value<[bool; 10]> {
+        self.b_lo
+            .spread
+            .value()
+            .zip(self.b_hi.spread.value())
+            .map(|(b_lo, b_hi)| {
+                b_lo.iter()
+                    .chain(b_hi.iter())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap()
+            })
+    }
+
+    fn spread_c(&self) -> Value<[bool; 28]> {
+        self.c.spread.value().map(|v| v.0)
+    }
+
+    fn spread_d(&self) -> Value<[bool; 14]> {
+        self.d.spread.value().map(|v| v.0)
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct RoundWordSpread {
-    dense_halves: (CellValue16, CellValue16),
-    spread_halves: (CellValue32, CellValue32),
+pub struct RoundWordDense<F: FieldExt>(AssignedBits<16, F>, AssignedBits<16, F>);
+
+impl<F: FieldExt> From<(AssignedBits<16, F>, AssignedBits<16, F>)> for RoundWordDense<F> {
+    fn from(halves: (AssignedBits<16, F>, AssignedBits<16, F>)) -> Self {
+        Self(halves.0, halves.1)
+    }
 }
 
-impl RoundWordSpread {
+impl<F: FieldExt> RoundWordDense<F> {
+    pub fn value(&self) -> Value<u32> {
+        self.0
+            .value_u16()
+            .zip(self.1.value_u16())
+            .map(|(lo, hi)| lo as u32 + (1 << 16) * hi as u32)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RoundWordSpread<F: FieldExt>(AssignedBits<32, F>, AssignedBits<32, F>);
+
+impl<F: FieldExt> From<(AssignedBits<32, F>, AssignedBits<32, F>)> for RoundWordSpread<F> {
+    fn from(halves: (AssignedBits<32, F>, AssignedBits<32, F>)) -> Self {
+        Self(halves.0, halves.1)
+    }
+}
+
+impl<F: FieldExt> RoundWordSpread<F> {
+    pub fn value(&self) -> Value<u64> {
+        self.0
+            .value_u32()
+            .zip(self.1.value_u32())
+            .map(|(lo, hi)| lo as u64 + (1 << 32) * hi as u64)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RoundWordA<F: FieldExt> {
+    pieces: Option<AbcdVar<F>>,
+    dense_halves: RoundWordDense<F>,
+    spread_halves: Option<RoundWordSpread<F>>,
+}
+
+impl<F: FieldExt> RoundWordA<F> {
     pub fn new(
-        dense_halves: (CellValue16, CellValue16),
-        spread_halves: (CellValue32, CellValue32),
+        pieces: AbcdVar<F>,
+        dense_halves: RoundWordDense<F>,
+        spread_halves: RoundWordSpread<F>,
     ) -> Self {
-        RoundWordSpread {
+        RoundWordA {
+            pieces: Some(pieces),
+            dense_halves,
+            spread_halves: Some(spread_halves),
+        }
+    }
+
+    pub fn new_dense(dense_halves: RoundWordDense<F>) -> Self {
+        RoundWordA {
+            pieces: None,
+            dense_halves,
+            spread_halves: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RoundWordE<F: FieldExt> {
+    pieces: Option<EfghVar<F>>,
+    dense_halves: RoundWordDense<F>,
+    spread_halves: Option<RoundWordSpread<F>>,
+}
+
+impl<F: FieldExt> RoundWordE<F> {
+    pub fn new(
+        pieces: EfghVar<F>,
+        dense_halves: RoundWordDense<F>,
+        spread_halves: RoundWordSpread<F>,
+    ) -> Self {
+        RoundWordE {
+            pieces: Some(pieces),
+            dense_halves,
+            spread_halves: Some(spread_halves),
+        }
+    }
+
+    pub fn new_dense(dense_halves: RoundWordDense<F>) -> Self {
+        RoundWordE {
+            pieces: None,
+            dense_halves,
+            spread_halves: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RoundWord<F: FieldExt> {
+    dense_halves: RoundWordDense<F>,
+    spread_halves: RoundWordSpread<F>,
+}
+
+impl<F: FieldExt> RoundWord<F> {
+    pub fn new(dense_halves: RoundWordDense<F>, spread_halves: RoundWordSpread<F>) -> Self {
+        RoundWord {
             dense_halves,
             spread_halves,
         }
     }
 }
 
-#[allow(clippy::from_over_into)]
-impl Into<RoundWordDense> for RoundWordSpread {
-    fn into(self) -> RoundWordDense {
-        RoundWordDense::new(self.dense_halves)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct RoundWordA {
-    pieces: Option<AbcdVar>,
-    dense_halves: (CellValue16, CellValue16),
-    spread_halves: Option<(CellValue32, CellValue32)>,
-}
-
-impl RoundWordA {
-    pub fn new(
-        pieces: AbcdVar,
-        dense_halves: (CellValue16, CellValue16),
-        spread_halves: (CellValue32, CellValue32),
-    ) -> Self {
-        RoundWordA {
-            pieces: Some(pieces),
-            dense_halves,
-            spread_halves: Some(spread_halves),
-        }
-    }
-
-    pub fn new_dense(dense_halves: (CellValue16, CellValue16)) -> Self {
-        RoundWordA {
-            pieces: None,
-            dense_halves,
-            spread_halves: None,
-        }
-    }
-}
-
-#[allow(clippy::from_over_into)]
-impl Into<RoundWordSpread> for RoundWordA {
-    fn into(self) -> RoundWordSpread {
-        RoundWordSpread::new(self.dense_halves, self.spread_halves.unwrap())
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct RoundWordE {
-    pieces: Option<EfghVar>,
-    dense_halves: (CellValue16, CellValue16),
-    spread_halves: Option<(CellValue32, CellValue32)>,
-}
-
-impl RoundWordE {
-    pub fn new(
-        pieces: EfghVar,
-        dense_halves: (CellValue16, CellValue16),
-        spread_halves: (CellValue32, CellValue32),
-    ) -> Self {
-        RoundWordE {
-            pieces: Some(pieces),
-            dense_halves,
-            spread_halves: Some(spread_halves),
-        }
-    }
-
-    pub fn new_dense(dense_halves: (CellValue16, CellValue16)) -> Self {
-        RoundWordE {
-            pieces: None,
-            dense_halves,
-            spread_halves: None,
-        }
-    }
-}
-
-#[allow(clippy::from_over_into)]
-impl Into<RoundWordSpread> for RoundWordE {
-    fn into(self) -> RoundWordSpread {
-        RoundWordSpread::new(self.dense_halves, self.spread_halves.unwrap())
-    }
-}
-
 /// The internal state for SHA-256.
 #[derive(Clone, Debug)]
-pub struct State {
-    a: Option<StateWord>,
-    b: Option<StateWord>,
-    c: Option<StateWord>,
-    d: Option<StateWord>,
-    e: Option<StateWord>,
-    f: Option<StateWord>,
-    g: Option<StateWord>,
-    h: Option<StateWord>,
+pub struct State<F: FieldExt> {
+    a: Option<StateWord<F>>,
+    b: Option<StateWord<F>>,
+    c: Option<StateWord<F>>,
+    d: Option<StateWord<F>>,
+    e: Option<StateWord<F>>,
+    f: Option<StateWord<F>>,
+    g: Option<StateWord<F>>,
+    h: Option<StateWord<F>>,
 }
 
-impl State {
+impl<F: FieldExt> State<F> {
     #[allow(clippy::many_single_char_names)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        a: StateWord,
-        b: StateWord,
-        c: StateWord,
-        d: StateWord,
-        e: StateWord,
-        f: StateWord,
-        g: StateWord,
-        h: StateWord,
+        a: StateWord<F>,
+        b: StateWord<F>,
+        c: StateWord<F>,
+        d: StateWord<F>,
+        e: StateWord<F>,
+        f: StateWord<F>,
+        g: StateWord<F>,
+        h: StateWord<F>,
     ) -> Self {
         State {
             a: Some(a),
@@ -222,15 +420,15 @@ impl State {
 }
 
 #[derive(Clone, Debug)]
-pub enum StateWord {
-    A(RoundWordA),
-    B(RoundWordSpread),
-    C(RoundWordSpread),
-    D(RoundWordDense),
-    E(RoundWordE),
-    F(RoundWordSpread),
-    G(RoundWordSpread),
-    H(RoundWordDense),
+pub enum StateWord<F: FieldExt> {
+    A(RoundWordA<F>),
+    B(RoundWord<F>),
+    C(RoundWord<F>),
+    D(RoundWordDense<F>),
+    E(RoundWordE<F>),
+    F(RoundWord<F>),
+    G(RoundWord<F>),
+    H(RoundWordDense<F>),
 }
 
 #[derive(Clone, Debug)]
@@ -239,22 +437,22 @@ pub(super) struct CompressionConfig {
     message_schedule: Column<Advice>,
     extras: [Column<Advice>; 6],
 
-    s_ch: Column<Fixed>,
-    s_ch_neg: Column<Fixed>,
-    s_maj: Column<Fixed>,
-    s_h_prime: Column<Fixed>,
-    s_a_new: Column<Fixed>,
-    s_e_new: Column<Fixed>,
+    s_ch: Selector,
+    s_ch_neg: Selector,
+    s_maj: Selector,
+    s_h_prime: Selector,
+    s_a_new: Selector,
+    s_e_new: Selector,
 
-    s_upper_sigma_0: Column<Fixed>,
-    s_upper_sigma_1: Column<Fixed>,
+    s_upper_sigma_0: Selector,
+    s_upper_sigma_1: Selector,
 
     // Decomposition gate for AbcdVar
-    s_decompose_abcd: Column<Fixed>,
+    s_decompose_abcd: Selector,
     // Decomposition gate for EfghVar
-    s_decompose_efgh: Column<Fixed>,
+    s_decompose_efgh: Selector,
 
-    s_digest: Column<Fixed>,
+    s_digest: Selector,
 }
 
 impl<F: FieldExt> Table16Assignment<F> for CompressionConfig {}
@@ -266,22 +464,22 @@ impl CompressionConfig {
         message_schedule: Column<Advice>,
         extras: [Column<Advice>; 6],
     ) -> Self {
-        let s_ch = meta.fixed_column();
-        let s_ch_neg = meta.fixed_column();
-        let s_maj = meta.fixed_column();
-        let s_h_prime = meta.fixed_column();
-        let s_a_new = meta.fixed_column();
-        let s_e_new = meta.fixed_column();
+        let s_ch = meta.selector();
+        let s_ch_neg = meta.selector();
+        let s_maj = meta.selector();
+        let s_h_prime = meta.selector();
+        let s_a_new = meta.selector();
+        let s_e_new = meta.selector();
 
-        let s_upper_sigma_0 = meta.fixed_column();
-        let s_upper_sigma_1 = meta.fixed_column();
+        let s_upper_sigma_0 = meta.selector();
+        let s_upper_sigma_1 = meta.selector();
 
         // Decomposition gate for AbcdVar
-        let s_decompose_abcd = meta.fixed_column();
+        let s_decompose_abcd = meta.selector();
         // Decomposition gate for EfghVar
-        let s_decompose_efgh = meta.fixed_column();
+        let s_decompose_efgh = meta.selector();
 
-        let s_digest = meta.fixed_column();
+        let s_digest = meta.selector();
 
         // Rename these here for ease of matching the gates to the specification.
         let a_0 = lookup.tag;
@@ -298,7 +496,7 @@ impl CompressionConfig {
         // Decompose `A,B,C,D` words into (2, 11, 9, 10)-bit chunks.
         // `c` is split into (3, 3, 3)-bit c_lo, c_mid, c_hi.
         meta.create_gate("decompose ABCD", |meta| {
-            let s_decompose_abcd = meta.query_fixed(s_decompose_abcd, Rotation::cur());
+            let s_decompose_abcd = meta.query_selector(s_decompose_abcd);
             let a = meta.query_advice(a_3, Rotation::next()); // 2-bit chunk
             let spread_a = meta.query_advice(a_4, Rotation::next());
             let b = meta.query_advice(a_1, Rotation::cur()); // 11-bit chunk
@@ -345,7 +543,7 @@ impl CompressionConfig {
         // `a` is split into (3, 3)-bit a_lo, a_hi
         // `b` is split into (2, 3)-bit b_lo, b_hi
         meta.create_gate("Decompose EFGH", |meta| {
-            let s_decompose_efgh = meta.query_fixed(s_decompose_efgh, Rotation::cur());
+            let s_decompose_efgh = meta.query_selector(s_decompose_efgh);
             let a_lo = meta.query_advice(a_3, Rotation::next()); // 3-bit chunk
             let spread_a_lo = meta.query_advice(a_4, Rotation::next());
             let a_hi = meta.query_advice(a_5, Rotation::next()); // 3-bit chunk
@@ -391,7 +589,7 @@ impl CompressionConfig {
         // s_upper_sigma_0 on abcd words
         // (2, 11, 9, 10)-bit chunks
         meta.create_gate("s_upper_sigma_0", |meta| {
-            let s_upper_sigma_0 = meta.query_fixed(s_upper_sigma_0, Rotation::cur());
+            let s_upper_sigma_0 = meta.query_selector(s_upper_sigma_0);
             let spread_r0_even = meta.query_advice(a_2, Rotation::prev());
             let spread_r0_odd = meta.query_advice(a_2, Rotation::cur());
             let spread_r1_even = meta.query_advice(a_2, Rotation::next());
@@ -422,7 +620,7 @@ impl CompressionConfig {
         // s_upper_sigma_1 on efgh words
         // (6, 5, 14, 7)-bit chunks
         meta.create_gate("s_upper_sigma_1", |meta| {
-            let s_upper_sigma_1 = meta.query_fixed(s_upper_sigma_1, Rotation::cur());
+            let s_upper_sigma_1 = meta.query_selector(s_upper_sigma_1);
             let spread_r0_even = meta.query_advice(a_2, Rotation::prev());
             let spread_r0_odd = meta.query_advice(a_2, Rotation::cur());
             let spread_r1_even = meta.query_advice(a_2, Rotation::next());
@@ -452,7 +650,7 @@ impl CompressionConfig {
         // s_ch on efgh words
         // First part of choice gate on (E, F, G), E ∧ F
         meta.create_gate("s_ch", |meta| {
-            let s_ch = meta.query_fixed(s_ch, Rotation::cur());
+            let s_ch = meta.query_selector(s_ch);
             let spread_p0_even = meta.query_advice(a_2, Rotation::prev());
             let spread_p0_odd = meta.query_advice(a_2, Rotation::cur());
             let spread_p1_even = meta.query_advice(a_2, Rotation::next());
@@ -478,7 +676,7 @@ impl CompressionConfig {
         // s_ch_neg on efgh words
         // Second part of Choice gate on (E, F, G), ¬E ∧ G
         meta.create_gate("s_ch_neg", |meta| {
-            let s_ch_neg = meta.query_fixed(s_ch_neg, Rotation::cur());
+            let s_ch_neg = meta.query_selector(s_ch_neg);
             let spread_q0_even = meta.query_advice(a_2, Rotation::prev());
             let spread_q0_odd = meta.query_advice(a_2, Rotation::cur());
             let spread_q1_even = meta.query_advice(a_2, Rotation::next());
@@ -507,7 +705,7 @@ impl CompressionConfig {
 
         // s_maj on abcd words
         meta.create_gate("s_maj", |meta| {
-            let s_maj = meta.query_fixed(s_maj, Rotation::cur());
+            let s_maj = meta.query_selector(s_maj);
             let spread_m0_even = meta.query_advice(a_2, Rotation::prev());
             let spread_m0_odd = meta.query_advice(a_2, Rotation::cur());
             let spread_m1_even = meta.query_advice(a_2, Rotation::next());
@@ -536,7 +734,7 @@ impl CompressionConfig {
 
         // s_h_prime to compute H' = H + Ch(E, F, G) + s_upper_sigma_1(E) + K + W
         meta.create_gate("s_h_prime", |meta| {
-            let s_h_prime = meta.query_fixed(s_h_prime, Rotation::cur());
+            let s_h_prime = meta.query_selector(s_h_prime);
             let h_prime_lo = meta.query_advice(a_7, Rotation::next());
             let h_prime_hi = meta.query_advice(a_8, Rotation::next());
             let h_prime_carry = meta.query_advice(a_9, Rotation::next());
@@ -575,7 +773,7 @@ impl CompressionConfig {
 
         // s_a_new
         meta.create_gate("s_a_new", |meta| {
-            let s_a_new = meta.query_fixed(s_a_new, Rotation::cur());
+            let s_a_new = meta.query_selector(s_a_new);
             let a_new_lo = meta.query_advice(a_8, Rotation::cur());
             let a_new_hi = meta.query_advice(a_8, Rotation::next());
             let a_new_carry = meta.query_advice(a_9, Rotation::cur());
@@ -602,7 +800,7 @@ impl CompressionConfig {
 
         // s_e_new
         meta.create_gate("s_e_new", |meta| {
-            let s_e_new = meta.query_fixed(s_e_new, Rotation::cur());
+            let s_e_new = meta.query_selector(s_e_new);
             let e_new_lo = meta.query_advice(a_8, Rotation::cur());
             let e_new_hi = meta.query_advice(a_8, Rotation::next());
             let e_new_carry = meta.query_advice(a_9, Rotation::next());
@@ -625,7 +823,7 @@ impl CompressionConfig {
 
         // s_digest for final round
         meta.create_gate("s_digest", |meta| {
-            let s_digest = meta.query_fixed(s_digest, Rotation::cur());
+            let s_digest = meta.query_selector(s_digest);
             let lo_0 = meta.query_advice(a_3, Rotation::cur());
             let hi_0 = meta.query_advice(a_4, Rotation::cur());
             let word_0 = meta.query_advice(a_5, Rotation::cur());
@@ -669,7 +867,7 @@ impl CompressionConfig {
         &self,
         layouter: &mut impl Layouter<F>,
         init_state: [u32; STATE],
-    ) -> Result<State, Error> {
+    ) -> Result<State<F>, Error> {
         let mut new_state = State::empty_state();
         layouter.assign_region(
             || "initialize_with_iv",
@@ -686,8 +884,8 @@ impl CompressionConfig {
     pub(super) fn initialize_with_state<F: FieldExt>(
         &self,
         layouter: &mut impl Layouter<F>,
-        init_state: State,
-    ) -> Result<State, Error> {
+        init_state: State<F>,
+    ) -> Result<State<F>, Error> {
         let mut new_state = State::empty_state();
         layouter.assign_region(
             || "initialize_with_state",
@@ -703,17 +901,16 @@ impl CompressionConfig {
     pub(super) fn compress<F: FieldExt>(
         &self,
         layouter: &mut impl Layouter<F>,
-        initialized_state: State,
-        w_halves: [(CellValue16, CellValue16); ROUNDS],
-    ) -> Result<State, Error> {
+        initialized_state: State<F>,
+        w_halves: [(AssignedBits<16, F>, AssignedBits<16, F>); ROUNDS],
+    ) -> Result<State<F>, Error> {
         let mut state = State::empty_state();
         layouter.assign_region(
             || "compress",
             |mut region| {
                 state = initialized_state.clone();
-                for idx in 0..64 {
-                    state =
-                        self.assign_round(&mut region, idx, state.clone(), w_halves[idx as usize])?;
+                for (idx, w_halves) in w_halves.iter().enumerate() {
+                    state = self.assign_round(&mut region, idx.into(), state.clone(), w_halves)?;
                 }
                 Ok(())
             },
@@ -725,9 +922,9 @@ impl CompressionConfig {
     pub(super) fn digest<F: FieldExt>(
         &self,
         layouter: &mut impl Layouter<F>,
-        state: State,
+        state: State<F>,
     ) -> Result<[BlockWord; DIGEST_SIZE], Error> {
-        let mut digest = [BlockWord(Some(0)); DIGEST_SIZE];
+        let mut digest = [BlockWord(Value::known(0)); DIGEST_SIZE];
         layouter.assign_region(
             || "digest",
             |mut region| {
@@ -745,11 +942,10 @@ mod tests {
     use super::super::{
         super::BLOCK_SIZE, msg_schedule_test_input, BlockWord, Table16Chip, Table16Config, IV,
     };
-    use halo2::{
-        arithmetic::FieldExt,
+    use halo2wrong::curves::pasta::pallas;
+    use halo2wrong::halo2::{
         circuit::{Layouter, SimpleFloorPlanner},
         dev::MockProver,
-        pasta::Fp,
         plonk::{Circuit, ConstraintSystem, Error},
     };
 
@@ -757,7 +953,7 @@ mod tests {
     fn compress() {
         struct MyCircuit {}
 
-        impl<F: FieldExt> Circuit<F> for MyCircuit {
+        impl Circuit<pallas::Base> for MyCircuit {
             type Config = Table16Config;
             type FloorPlanner = SimpleFloorPlanner;
 
@@ -765,16 +961,16 @@ mod tests {
                 MyCircuit {}
             }
 
-            fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+            fn configure(meta: &mut ConstraintSystem<pallas::Base>) -> Self::Config {
                 Table16Chip::configure(meta)
             }
 
             fn synthesize(
                 &self,
                 config: Self::Config,
-                mut layouter: impl Layouter<F>,
+                mut layouter: impl Layouter<pallas::Base>,
             ) -> Result<(), Error> {
-                Table16Chip::<F>::load(config.clone(), &mut layouter)?;
+                Table16Chip::load(config.clone(), &mut layouter)?;
 
                 // Test vector: "abc"
                 let input: [BlockWord; BLOCK_SIZE] = msg_schedule_test_input();
@@ -790,10 +986,10 @@ mod tests {
 
                 let digest = config.compression.digest(&mut layouter, state)?;
                 for (idx, digest_word) in digest.iter().enumerate() {
-                    assert_eq!(
-                        (digest_word.0.unwrap() as u64 + IV[idx] as u64) as u32,
-                        super::compression_util::COMPRESSION_OUTPUT[idx]
-                    );
+                    digest_word.0.assert_if_known(|digest_word| {
+                        (*digest_word as u64 + IV[idx] as u64) as u32
+                            == super::compression_util::COMPRESSION_OUTPUT[idx]
+                    });
                 }
 
                 Ok(())
@@ -802,7 +998,7 @@ mod tests {
 
         let circuit: MyCircuit = MyCircuit {};
 
-        let prover = match MockProver::<Fp>::run(17, &circuit, vec![]) {
+        let prover = match MockProver::<pallas::Base>::run(17, &circuit, vec![]) {
             Ok(prover) => prover,
             Err(e) => panic!("{:?}", e),
         };
