@@ -21,6 +21,8 @@ mod subregion_initial;
 mod subregion_main;
 
 use compression_gates::CompressionGate;
+#[cfg(test)]
+pub use compression_util::COMPRESSION_OUTPUT;
 
 pub trait UpperSigmaVar<
     const A_LEN: usize,
