@@ -12,33 +12,31 @@ impl CompressionConfig {
     pub fn initialize_iv<F: FieldExt>(
         &self,
         region: &mut Region<'_, F>,
-        iv: [u32; STATE],
+        iv: [Value<u32>; STATE],
     ) -> Result<State<F>, Error> {
         let a_7 = self.extras[3];
 
         // Decompose E into (6, 5, 14, 7)-bit chunks
-        let e = self.decompose_e(region, RoundIdx::Init, Value::known(iv[4]))?;
+        let e = self.decompose_e(region, RoundIdx::Init, iv[4])?;
 
         // Decompose F, G
-        let f = self.decompose_f(region, InitialRound, Value::known(iv[5]))?;
-        let g = self.decompose_g(region, InitialRound, Value::known(iv[6]))?;
+        let f = self.decompose_f(region, InitialRound, iv[5])?;
+        let g = self.decompose_g(region, InitialRound, iv[6])?;
 
         // Assign H
         let h_row = get_h_row(RoundIdx::Init);
-        let h =
-            self.assign_word_halves_dense(region, h_row, a_7, h_row + 1, a_7, Value::known(iv[7]))?;
+        let h = self.assign_word_halves_dense(region, h_row, a_7, h_row + 1, a_7, iv[7])?;
 
         // Decompose A into (2, 11, 9, 10)-bit chunks
-        let a = self.decompose_a(region, RoundIdx::Init, Value::known(iv[0]))?;
+        let a = self.decompose_a(region, RoundIdx::Init, iv[0])?;
 
         // Decompose B, C
-        let b = self.decompose_b(region, InitialRound, Value::known(iv[1]))?;
-        let c = self.decompose_c(region, InitialRound, Value::known(iv[2]))?;
+        let b = self.decompose_b(region, InitialRound, iv[1])?;
+        let c = self.decompose_c(region, InitialRound, iv[2])?;
 
         // Assign D
         let d_row = get_d_row(RoundIdx::Init);
-        let d =
-            self.assign_word_halves_dense(region, d_row, a_7, d_row + 1, a_7, Value::known(iv[3]))?;
+        let d = self.assign_word_halves_dense(region, d_row, a_7, d_row + 1, a_7, iv[3])?;
 
         Ok(State::new(
             StateWord::A(a),

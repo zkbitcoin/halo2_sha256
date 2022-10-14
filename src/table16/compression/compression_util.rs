@@ -199,7 +199,7 @@ pub fn get_digest_efgh_row() -> usize {
 }
 
 impl CompressionConfig {
-    pub(super) fn decompose_abcd<F: FieldExt>(
+    pub(crate) fn decompose_abcd<F: FieldExt>(
         &self,
         region: &mut Region<'_, F>,
         row: usize,
@@ -270,7 +270,7 @@ impl CompressionConfig {
         })
     }
 
-    pub(super) fn decompose_efgh<F: FieldExt>(
+    pub(crate) fn decompose_efgh<F: FieldExt>(
         &self,
         region: &mut Region<'_, F>,
         row: usize,
@@ -341,7 +341,7 @@ impl CompressionConfig {
         })
     }
 
-    pub(super) fn decompose_a<F: FieldExt>(
+    pub(crate) fn decompose_a<F: FieldExt>(
         &self,
         region: &mut Region<'_, F>,
         round_idx: RoundIdx,
@@ -354,7 +354,7 @@ impl CompressionConfig {
         Ok(RoundWordA::new(a_pieces, dense_halves, spread_halves))
     }
 
-    pub(super) fn decompose_e<F: FieldExt>(
+    pub(crate) fn decompose_e<F: FieldExt>(
         &self,
         region: &mut Region<'_, F>,
         round_idx: RoundIdx,
@@ -367,7 +367,7 @@ impl CompressionConfig {
         Ok(RoundWordE::new(e_pieces, dense_halves, spread_halves))
     }
 
-    pub(super) fn assign_upper_sigma_0<F: FieldExt>(
+    pub(crate) fn assign_upper_sigma_0<F: FieldExt>(
         &self,
         region: &mut Region<'_, F>,
         round_idx: MainRoundIdx,
@@ -425,7 +425,7 @@ impl CompressionConfig {
         )
     }
 
-    pub(super) fn assign_upper_sigma_1<F: FieldExt>(
+    pub(crate) fn assign_upper_sigma_1<F: FieldExt>(
         &self,
         region: &mut Region<'_, F>,
         round_idx: MainRoundIdx,

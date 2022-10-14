@@ -276,6 +276,10 @@ impl<F: FieldExt> RoundWordDense<F> {
             .zip(self.1.value_u16())
             .map(|(lo, hi)| lo as u32 + (1 << 16) * hi as u32)
     }
+
+    pub fn halves(&self) -> (AssignedBits<16, F>, AssignedBits<16, F>) {
+        (self.0.clone(), self.1.clone())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -323,6 +327,10 @@ impl<F: FieldExt> RoundWordA<F> {
             spread_halves: None,
         }
     }
+
+    pub fn dense_halves(&self) -> RoundWordDense<F> {
+        self.dense_halves.clone()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -352,6 +360,10 @@ impl<F: FieldExt> RoundWordE<F> {
             spread_halves: None,
         }
     }
+
+    pub fn dense_halves(&self) -> RoundWordDense<F> {
+        self.dense_halves.clone()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -366,6 +378,10 @@ impl<F: FieldExt> RoundWord<F> {
             dense_halves,
             spread_halves,
         }
+    }
+
+    pub fn dense_halves(&self) -> RoundWordDense<F> {
+        self.dense_halves.clone()
     }
 }
 
@@ -419,6 +435,21 @@ impl<F: FieldExt> State<F> {
             h: None,
         }
     }
+
+    pub fn split_state(
+        &self,
+    ) -> (
+        RoundWordA<F>,
+        RoundWord<F>,
+        RoundWord<F>,
+        RoundWordDense<F>,
+        RoundWordE<F>,
+        RoundWord<F>,
+        RoundWord<F>,
+        RoundWordDense<F>,
+    ) {
+        compression_util::match_state(self.clone())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -434,7 +465,7 @@ pub enum StateWord<F: FieldExt> {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct CompressionConfig {
+pub(crate) struct CompressionConfig {
     lookup: SpreadInputs,
     message_schedule: Column<Advice>,
     extras: [Column<Advice>; 6],
@@ -865,10 +896,10 @@ impl CompressionConfig {
 
     /// Initialize compression with a constant Initialization Vector of 32-byte words.
     /// Returns an initialized state.
-    pub(super) fn initialize_with_iv<F: FieldExt>(
+    pub(crate) fn initialize_with_iv<F: FieldExt>(
         &self,
         layouter: &mut impl Layouter<F>,
-        init_state: [u32; STATE],
+        init_state: [Value<u32>; STATE],
     ) -> Result<State<F>, Error> {
         let mut new_state = State::empty_state();
         layouter.assign_region(
@@ -941,12 +972,14 @@ impl CompressionConfig {
 
 #[cfg(test)]
 mod tests {
+    use crate::table16::STATE;
+
     use super::super::{
         super::BLOCK_SIZE, msg_schedule_test_input, BlockWord, Table16Chip, Table16Config, IV,
     };
     use halo2wrong::curves::pasta::pallas;
     use halo2wrong::halo2::{
-        circuit::{Layouter, SimpleFloorPlanner},
+        circuit::{Layouter, SimpleFloorPlanner, Value},
         dev::MockProver,
         plonk::{Circuit, ConstraintSystem, Error},
     };
@@ -977,10 +1010,14 @@ mod tests {
                 // Test vector: "abc"
                 let input: [BlockWord; BLOCK_SIZE] = msg_schedule_test_input();
 
-                let (_, w_halves) = config.message_schedule.process(&mut layouter, input)?;
+                let (_, w_halves, _) = config.message_schedule.process(&mut layouter, input)?;
 
                 let compression = config.compression.clone();
-                let initial_state = compression.initialize_with_iv(&mut layouter, IV)?;
+                let mut init_vector = [Value::unknown(); STATE];
+                for i in 0..STATE {
+                    init_vector[i] = Value::known(IV[i]);
+                }
+                let initial_state = compression.initialize_with_iv(&mut layouter, init_vector)?;
 
                 let state = config
                     .compression

@@ -2,26 +2,26 @@
 //!
 //! [SHA-256]: https://tools.ietf.org/html/rfc6234
 
-use std::cmp::min;
 use std::convert::TryInto;
 use std::fmt;
+use std::{cmp::min, ops::Deref};
 
-use crate::{table16::lebs2ip, BlockWord};
-use halo2wrong::halo2::{
-    arithmetic::FieldExt,
-    circuit::{AssignedCell, Chip, Layouter, Value},
-    plonk::Error,
+use crate::{
+    AssignedBits, BlockWord, RoundWordDense, State, Table16Chip, Table16Config, BLOCK_SIZE,
+    DIGEST_SIZE, STATE,
+};
+use halo2wrong::{
+    halo2::{
+        arithmetic::FieldExt,
+        circuit::{layouter, AssignedCell, Chip, Layouter, Value},
+        plonk::{Advice, Column, ConstraintSystem, Error, Selector},
+    },
+    RegionCtx,
 };
 
 // use crate::{BlockWord, Table16Chip, Table16Config};
 
-/// The size of a SHA-256 block, in 32-bit words.
-pub const BLOCK_SIZE: usize = 16;
-/// The size of a SHA-256 digest, in 32-bit words.
-pub(crate) const DIGEST_SIZE: usize = 8;
-
-/// The set of circuit instructions required to use the [`Sha256`] gadget.
-pub trait Sha256Instructions<F: FieldExt>: Chip<F> {
+pub trait Sha256Compression<F: FieldExt>: Chip<F> {
     /// Variable representing the SHA-256 internal state.
     type State: Clone + fmt::Debug;
     /// Variable representing a 32-bit word of the input block to the SHA-256 compression
@@ -39,56 +39,583 @@ pub trait Sha256Instructions<F: FieldExt>: Chip<F> {
     ) -> Result<Self::State, Error>;
 
     /// Starting from the given initialized state, processes a block of input and returns the
-    /// final state.
     fn compress(
         &self,
         layouter: &mut impl Layouter<F>,
         initialized_state: &Self::State,
-        input: [Self::BlockWord; BLOCK_SIZE],
-    ) -> Result<Self::State, Error>;
+        input: [BlockWord; super::BLOCK_SIZE],
+    ) -> Result<(Self::State, Vec<AssignedBits<32, F>>), Error>;
 
+    /*
     /// Converts the given state into a message digest.
     fn digest(
         &self,
         layouter: &mut impl Layouter<F>,
         state: &Self::State,
-    ) -> Result<[Self::BlockWord; DIGEST_SIZE], Error>;
-
-    /*
-    /// Converts the given state into a message digest.
-    fn digest_cells(
-        &self,
-        layouter: &mut impl Layouter<F>,
-        state: &Self::State,
-    ) -> Result<[AssignedCell<F, F>; DIGEST_SIZE], Error>;*/
+    ) -> Result<[Self::BlockWord; DIGEST_SIZE], Error>;*/
 }
 
+/*
 /// The output of a SHA-256 circuit invocation.
 #[derive(Debug)]
-pub struct Sha256Digest<BlockWord>(pub [BlockWord; DIGEST_SIZE]);
+pub struct Sha256Digest<BlockWord>(pub [BlockWord; DIGEST_SIZE]);*/
+
+use maingate::{
+    AssignedValue, MainGate, MainGateConfig, MainGateInstructions, RangeChip, RangeConfig,
+    RangeInstructions,
+};
+
+#[derive(Debug, Clone)]
+pub struct Sha256Config {
+    main_gate_config: MainGateConfig,
+    range_config: RangeConfig,
+    table16_config: Table16Config,
+    max_byte_size: usize,
+    max_round: usize,
+    /*is_real_input: Column<Advice>,
+    real_input_byte_acc: Column<Advice>,
+    is_zero_padding: Column<Advice>,
+    zero_padding_byte_acc: Column<Advice>,
+    is_len_padding: Column<Advice>,
+    len_padding_byte_acc: Column<Advice>,*/
+}
+
+pub type AssignedDigest<F: FieldExt> = [AssignedValue<F>; DIGEST_SIZE];
 
 /// A gadget that constrains a SHA-256 invocation. It supports input at a granularity of
 /// 32 bits.
 #[derive(Debug)]
-pub struct Sha256<F: FieldExt, CS: Sha256Instructions<F>> {
-    chip: CS,
-    state: CS::State,
-    cur_block: Vec<CS::BlockWord>,
-    length: usize,
+pub struct Sha256Chip<F: FieldExt> {
+    config: Sha256Config,
+    states: Vec<State<F>>,
 }
 
-impl<F: FieldExt, Sha256Chip: Sha256Instructions<F>> Sha256<F, Sha256Chip> {
+impl<F: FieldExt> Sha256Chip<F> {
+    const NUM_LOOKUP_TABLES: usize = 8;
     /// Create a new hasher instance.
-    pub fn new(chip: Sha256Chip, mut layouter: impl Layouter<F>) -> Result<Self, Error> {
-        let state = chip.initialization_vector(&mut layouter)?;
-        Ok(Sha256 {
-            chip,
-            state,
-            cur_block: Vec::with_capacity(BLOCK_SIZE),
-            length: 0,
-        })
+    pub fn new(config: Sha256Config) -> Self {
+        let states = Vec::new();
+        Self { config, states }
     }
 
+    pub fn configure(meta: &mut ConstraintSystem<F>, max_byte_size: usize) -> Sha256Config {
+        let main_gate_config = MainGate::configure(meta);
+        let composition_bit_lens = vec![8 / Self::NUM_LOOKUP_TABLES, 32 / Self::NUM_LOOKUP_TABLES];
+        let range_config =
+            RangeChip::configure(meta, &main_gate_config, composition_bit_lens, vec![]);
+        let table16_config = Table16Chip::configure(meta);
+
+        let one_round_size = 4 * BLOCK_SIZE;
+        let max_round = if max_byte_size % one_round_size == 0 {
+            max_byte_size / one_round_size
+        } else {
+            max_byte_size / one_round_size
+        };
+
+        /*let is_real_input = meta.advice_column();
+        let real_input_byte_acc = meta.advice_column();
+        let is_zero_padding = meta.advice_column();
+        let zero_padding_byte_acc = meta.advice_column();
+        let is_len_padding = meta.advice_column();
+        let len_padding_byte_acc = meta.advice_column();
+        for column in [
+            is_real_input,
+            real_input_byte_acc,
+            is_zero_padding,
+            zero_padding_byte_acc,
+            is_len_padding,
+            len_padding_byte_acc,
+        ] {
+            meta.enable_equality(column)
+        }*/
+        Sha256Config {
+            main_gate_config,
+            range_config,
+            table16_config,
+            max_byte_size,
+            max_round,
+            /*is_real_input,
+            real_input_byte_acc,
+            is_zero_padding,
+            zero_padding_byte_acc,
+            is_len_padding,
+            len_padding_byte_acc,*/
+        }
+    }
+
+    pub fn init(&mut self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
+        let table16_chip = self.table16_chip();
+        let init_state = table16_chip.initialization_vector(layouter)?;
+        self.states.push(init_state);
+        Ok(())
+    }
+
+    pub fn internal_assigned_digest(
+        &self,
+        ctx: &mut RegionCtx<F>,
+        idx: usize,
+    ) -> Result<AssignedDigest<F>, Error> {
+        self.state_to_assigned_halves(ctx, &self.states[idx])
+    }
+
+    pub fn last_assigned_digest(&self, ctx: &mut RegionCtx<F>) -> Result<AssignedDigest<F>, Error> {
+        self.internal_assigned_digest(ctx, self.states.len() - 1)
+    }
+
+    pub fn update(
+        &mut self,
+        ctx: &mut RegionCtx<F>,
+        layouter: &mut impl Layouter<F>,
+        inputs: &[Value<u8>],
+    ) -> Result<(AssignedDigest<F>, Vec<AssignedValue<F>>), Error> {
+        let input_byte_size = inputs.len();
+        assert!(input_byte_size <= self.config.max_byte_size);
+        let input_byte_size_with64 = input_byte_size + 8;
+        let one_round_size = 4 * BLOCK_SIZE;
+        let num_round = if input_byte_size_with64 % one_round_size == 0 {
+            input_byte_size_with64 / one_round_size
+        } else {
+            input_byte_size_with64 / one_round_size
+        };
+        let padded_size = one_round_size * num_round;
+        let zero_padding_byte_size = padded_size - input_byte_size - 8;
+        let remaining_byte_size = self.config.max_byte_size - zero_padding_byte_size - 8;
+
+        let main_gate = self.main_gate();
+        let assigned_inpu_byte_size =
+            main_gate.assign_value(ctx, Value::known(F::from_u128(input_byte_size as u128)))?;
+        let assigned_num_round =
+            main_gate.assign_value(ctx, Value::known(F::from_u128(num_round as u128)))?;
+        let assigned_padded_size =
+            main_gate.assign_value(ctx, Value::known(F::from_u128(padded_size as u128)))?;
+        let assigned_zero_padding_byte_size = main_gate.assign_value(
+            ctx,
+            Value::known(F::from_u128(zero_padding_byte_size as u128)),
+        )?;
+        let assigned_remaining_byte_size =
+            main_gate.assign_value(ctx, Value::known(F::from_u128(remaining_byte_size as u128)))?;
+        let assigned_one_round_size =
+            main_gate.assign_constant(ctx, F::from_u128(one_round_size as u128))?;
+        let assigned_max_byte_size =
+            main_gate.assign_constant(ctx, F::from_u128(self.config.max_byte_size as u128))?;
+        let assigned_max_round =
+            main_gate.assign_constant(ctx, F::from_u128(self.config.max_round as u128))?;
+        let eight = main_gate.assign_constant(ctx, F::from_u128(8u128))?;
+
+        let range_chip = self.range_chip();
+
+        // 1. one_round_size * num_round == padded_size
+        let round_mul = main_gate.mul(ctx, &assigned_one_round_size, &assigned_num_round)?;
+        main_gate.assert_equal(ctx, &round_mul, &assigned_padded_size)?;
+        // 2. padded_size == input_byte_size + padding_byte_size + 8
+        let byte_size_add = main_gate.add(
+            ctx,
+            &assigned_inpu_byte_size,
+            &assigned_zero_padding_byte_size,
+        )?;
+        let byte_size_add = main_gate.add(ctx, &eight, &byte_size_add)?;
+        main_gate.assert_equal(ctx, &byte_size_add, &assigned_padded_size)?;
+        // 3. padded_size + remaining_byte_size == max_byte_size
+        let byte_size_add =
+            main_gate.add(ctx, &assigned_padded_size, &assigned_remaining_byte_size)?;
+        main_gate.assert_equal(ctx, &byte_size_add, &assigned_max_byte_size)?;
+
+        let range_chip = self.range_chip();
+        // 3. input_bit_size <= max_bit_size
+        let byte_size_sub =
+            main_gate.sub(ctx, &assigned_max_byte_size, &assigned_inpu_byte_size)?;
+        let range_assigned = range_chip.assign(
+            ctx,
+            byte_size_sub.value().map(|v| *v),
+            64 / Self::NUM_LOOKUP_TABLES,
+            64,
+        )?;
+        main_gate.assert_equal(ctx, &byte_size_sub, &range_assigned)?;
+        // 4. num_round <= max_round
+        let round_sub = main_gate.sub(ctx, &assigned_max_round, &assigned_num_round)?;
+        let range_assigned = range_chip.assign(
+            ctx,
+            round_sub.value().map(|v| *v),
+            64 / Self::NUM_LOOKUP_TABLES,
+            64,
+        )?;
+        main_gate.assert_equal(ctx, &round_sub, &range_assigned)?;
+
+        let input_size_decomposed_vals = input_byte_size
+            .to_be_bytes()
+            .iter()
+            .map(|byte| F::from_u128(*byte as u128))
+            .map(|val| range_chip.assign(ctx, Value::known(val), 8 / Self::NUM_LOOKUP_TABLES, 8))
+            .collect::<Result<Vec<AssignedValue<F>>, Error>>()?;
+        let mut composed_val = main_gate.assign_constant(ctx, F::zero())?;
+        let u1 = main_gate.assign_constant(ctx, F::from_u128(256u128))?;
+        let mut coeff = main_gate.assign_constant(ctx, F::one())?;
+        for val in input_size_decomposed_vals.iter().rev() {
+            composed_val = main_gate.mul_add(ctx, val, &coeff, &composed_val)?;
+            coeff = main_gate.mul(ctx, &coeff, &u1)?;
+        }
+        main_gate.assert_equal(ctx, &assigned_inpu_byte_size, &composed_val)?;
+
+        let mut assigned_real_inputs = inputs
+            .iter()
+            .map(|val| {
+                range_chip.assign(
+                    ctx,
+                    val.map(|v| F::from_u128(v as u128)),
+                    8 / Self::NUM_LOOKUP_TABLES,
+                    8,
+                )
+            })
+            .collect::<Result<Vec<AssignedValue<F>>, Error>>()?;
+        for _ in 0..(zero_padding_byte_size + 8 + remaining_byte_size) {
+            assigned_real_inputs.push(range_chip.assign(
+                ctx,
+                Value::known(F::zero()),
+                8 / Self::NUM_LOOKUP_TABLES,
+                8,
+            )?);
+        }
+        let mut assigned_zero_padding_inputs = Vec::with_capacity(self.config.max_byte_size);
+        for _ in 0..input_byte_size {
+            assigned_zero_padding_inputs.push(range_chip.assign(
+                ctx,
+                Value::known(F::zero()),
+                8 / Self::NUM_LOOKUP_TABLES,
+                8,
+            )?);
+        }
+        for _ in 0..zero_padding_byte_size {
+            assigned_zero_padding_inputs.push(range_chip.assign(
+                ctx,
+                Value::known(F::zero()),
+                8 / Self::NUM_LOOKUP_TABLES,
+                8,
+            )?);
+        }
+        for _ in 0..(remaining_byte_size + 8) {
+            assigned_zero_padding_inputs.push(range_chip.assign(
+                ctx,
+                Value::known(F::zero()),
+                8 / Self::NUM_LOOKUP_TABLES,
+                8,
+            )?);
+        }
+        let mut assigned_len_padding_inputs = Vec::with_capacity(self.config.max_byte_size);
+        for _ in 0..(input_byte_size + zero_padding_byte_size) {
+            assigned_len_padding_inputs.push(range_chip.assign(
+                ctx,
+                Value::known(F::zero()),
+                8 / Self::NUM_LOOKUP_TABLES,
+                8,
+            )?);
+        }
+        for i in 0..8 {
+            assigned_len_padding_inputs.push(input_size_decomposed_vals[i].clone());
+        }
+        for _ in 0..remaining_byte_size {
+            assigned_len_padding_inputs.push(range_chip.assign(
+                ctx,
+                Value::known(F::zero()),
+                8 / Self::NUM_LOOKUP_TABLES,
+                8,
+            )?);
+        }
+
+        let is_real_input = (0..self.config.max_byte_size)
+            .map(|i| {
+                if i < input_byte_size {
+                    main_gate.assign_bit(ctx, Value::known(F::one()))
+                } else {
+                    main_gate.assign_bit(ctx, Value::known(F::zero()))
+                }
+            })
+            .collect::<Result<Vec<AssignedValue<F>>, Error>>()?;
+        let is_zero_padding_input = (0..self.config.max_byte_size)
+            .map(|i| {
+                if input_byte_size <= i && i < (input_byte_size + zero_padding_byte_size) {
+                    main_gate.assign_bit(ctx, Value::known(F::one()))
+                } else {
+                    main_gate.assign_bit(ctx, Value::known(F::zero()))
+                }
+            })
+            .collect::<Result<Vec<AssignedValue<F>>, Error>>()?;
+        let is_len_padding_input = (0..self.config.max_byte_size)
+            .map(|i| {
+                if (input_byte_size + zero_padding_byte_size) <= i
+                    && i < (input_byte_size + zero_padding_byte_size + 8)
+                {
+                    main_gate.assign_bit(ctx, Value::known(F::one()))
+                } else {
+                    main_gate.assign_bit(ctx, Value::known(F::zero()))
+                }
+            })
+            .collect::<Result<Vec<AssignedValue<F>>, Error>>()?;
+        let mut real_input_byte_acc = main_gate.assign_constant(ctx, F::zero())?;
+        let mut zero_padding_byte_acc = main_gate.assign_constant(ctx, F::zero())?;
+        let mut len_padding_byte_acc = main_gate.assign_constant(ctx, F::zero())?;
+
+        main_gate.assert_one(ctx, &is_real_input[0])?;
+        for i in 0..(self.config.max_byte_size - 1) {
+            let is_next_eq = main_gate.is_equal(ctx, &is_real_input[i], &is_real_input[i + 1])?;
+            let not_next_eq = main_gate.not(ctx, &is_next_eq)?;
+            real_input_byte_acc = main_gate.add(ctx, &real_input_byte_acc, &is_real_input[i])?;
+            let is_acc_eq =
+                main_gate.is_equal(ctx, &real_input_byte_acc, &assigned_inpu_byte_size)?;
+            let is_vaild = main_gate.select(ctx, &not_next_eq, &is_next_eq, &is_acc_eq)?;
+            main_gate.assert_one(ctx, &is_vaild)?;
+        }
+        for i in 0..(self.config.max_byte_size - 1) {
+            let is_next_eq = main_gate.is_equal(
+                ctx,
+                &is_zero_padding_input[i],
+                &is_zero_padding_input[i + 1],
+            )?;
+            let not_next_eq = main_gate.not(ctx, &is_next_eq)?;
+            zero_padding_byte_acc =
+                main_gate.add(ctx, &zero_padding_byte_acc, &is_zero_padding_input[i])?;
+            let is_acc_eq = main_gate.is_equal(
+                ctx,
+                &zero_padding_byte_acc,
+                &assigned_zero_padding_byte_size,
+            )?;
+            let is_vaild = main_gate.select(ctx, &not_next_eq, &is_next_eq, &is_acc_eq)?;
+            main_gate.assert_one(ctx, &is_vaild)?;
+        }
+        for i in 0..(self.config.max_byte_size - 1) {
+            let is_next_eq =
+                main_gate.is_equal(ctx, &is_len_padding_input[i], &is_len_padding_input[i + 1])?;
+            let not_next_eq = main_gate.not(ctx, &is_next_eq)?;
+            len_padding_byte_acc =
+                main_gate.add(ctx, &len_padding_byte_acc, &is_len_padding_input[i])?;
+            let is_acc_eq = main_gate.is_equal(ctx, &len_padding_byte_acc, &eight)?;
+            let is_vaild = main_gate.select(ctx, &not_next_eq, &is_next_eq, &is_acc_eq)?;
+            main_gate.assert_one(ctx, &is_vaild)?;
+        }
+        for i in 0..(self.config.max_byte_size - 1) {
+            let is_real_turned_off =
+                main_gate.sub(ctx, &is_real_input[i], &is_real_input[i + 1])?;
+            let not_real_turned_off = main_gate.not(ctx, &is_real_turned_off)?;
+            let is_zero_truned_on = main_gate.sub(
+                ctx,
+                &is_zero_padding_input[i + 1],
+                &is_zero_padding_input[i],
+            )?;
+            let or1 = main_gate.or(ctx, &not_real_turned_off, &is_zero_truned_on)?;
+            main_gate.assert_one(ctx, &or1)?;
+
+            let is_zero_turned_off = main_gate.sub(
+                ctx,
+                &is_zero_padding_input[i],
+                &is_zero_padding_input[i + 1],
+            )?;
+            let not_zero_turned_off = main_gate.not(ctx, &is_zero_turned_off)?;
+            let is_len_truned_on =
+                main_gate.sub(ctx, &is_len_padding_input[i + 1], &is_len_padding_input[i])?;
+            let or2 = main_gate.or(ctx, &not_zero_turned_off, &is_len_truned_on)?;
+            main_gate.assert_one(ctx, &or2)?;
+        }
+
+        let mut conbined_inputs = Vec::with_capacity(self.config.max_byte_size);
+        for i in 0..self.config.max_byte_size {
+            let term1 = main_gate.mul(ctx, &assigned_real_inputs[i], &is_real_input[i])?;
+            let term2 = main_gate.mul(
+                ctx,
+                &assigned_zero_padding_inputs[i],
+                &is_zero_padding_input[i],
+            )?;
+            let term3 = main_gate.mul(
+                ctx,
+                &assigned_len_padding_inputs[i],
+                &is_len_padding_input[i],
+            )?;
+            let combined = main_gate.add(ctx, &term1, &term2)?;
+            conbined_inputs.push(main_gate.add(ctx, &combined, &term3)?);
+        }
+
+        for assigned_input_block in conbined_inputs.chunks((32 / 8) * BLOCK_SIZE) {
+            let blockword_inputs = assigned_input_block
+                .chunks(32 / 8)
+                .map(|vals| {
+                    let val_u32s = vals
+                        .iter()
+                        .map(|val| val.value().map(|v| v.get_lower_32()))
+                        .collect::<Vec<Value<u32>>>();
+                    let val_u32 = val_u32s[0]
+                        .zip(val_u32s[1])
+                        .zip(val_u32s[2])
+                        .zip(val_u32s[3])
+                        .map(|(((v0, v1), v2), v3)| {
+                            v0 + (1 << 8) * v1 + (1 << 16) * v2 + (1 << 24) * v3
+                        });
+                    BlockWord(val_u32)
+                })
+                .collect::<Vec<BlockWord>>();
+            let (new_state, assigned_inputs) =
+                self.compute_one_round(ctx, layouter, blockword_inputs.try_into().unwrap())?;
+            self.states.push(new_state);
+
+            let mut assigned_u32s = Vec::new();
+            let u8 = main_gate.assign_constant(ctx, F::from_u128(1u128 << 8))?;
+            let u16 = main_gate.assign_constant(ctx, F::from_u128(1u128 << 16))?;
+            let u24 = main_gate.assign_constant(ctx, F::from_u128(1u128 << 24))?;
+            for vals in assigned_input_block.chunks(32 / 8) {
+                let assigned_u32 = main_gate.mul_add(ctx, &u8, &vals[1], &vals[0])?;
+                let assigned_u32 = main_gate.mul_add(ctx, &u16, &vals[2], &assigned_u32)?;
+                let assigned_u32 = main_gate.mul_add(ctx, &u24, &vals[3], &assigned_u32)?;
+                assigned_u32s.push(assigned_u32);
+            }
+            for (input, u32) in assigned_inputs.iter().zip(assigned_u32s) {
+                ctx.constrain_equal(input.deref().cell(), u32.cell())?;
+            }
+        }
+
+        let assigned_digests = (0..self.config.max_round)
+            .map(|n_round| self.internal_assigned_digest(ctx, n_round))
+            .collect::<Result<Vec<AssignedDigest<F>>, Error>>()?;
+
+        let zero = main_gate.assign_constant(ctx, F::zero())?;
+        let mut new_digest_values: [AssignedValue<F>; DIGEST_SIZE] = (0..DIGEST_SIZE)
+            .map(|_| zero.clone())
+            .collect::<Vec<AssignedValue<F>>>()
+            .try_into()
+            .unwrap();
+        for n_round in 0..self.config.max_round {
+            let assigned_n_round =
+                main_gate.assign_constant(ctx, F::from_u128(n_round as u128 + 1))?;
+            let is_eq = main_gate.is_equal(ctx, &assigned_n_round, &assigned_num_round)?;
+            for j in 0..DIGEST_SIZE {
+                new_digest_values[j] = main_gate.mul_add(
+                    ctx,
+                    &is_eq,
+                    &assigned_digests[n_round][j],
+                    &new_digest_values[j],
+                )?;
+            }
+        }
+
+        Ok((new_digest_values, conbined_inputs))
+    }
+
+    /// Getter for [`RangeChip`].
+    pub fn range_chip(&self) -> RangeChip<F> {
+        RangeChip::<F>::new(self.config.range_config.clone())
+    }
+
+    /// Getter for [`MainGate`].
+    pub fn main_gate(&self) -> MainGate<F> {
+        MainGate::<F>::new(self.config.main_gate_config.clone())
+    }
+
+    /// Getter for [`Table16Chip`].
+    pub fn table16_chip(&self) -> Table16Chip<F> {
+        Table16Chip::construct(self.config.table16_config.clone())
+    }
+
+    fn compute_one_round(
+        &self,
+        ctx: &mut RegionCtx<F>,
+        layouter: &mut impl Layouter<F>,
+        input: [BlockWord; super::BLOCK_SIZE],
+    ) -> Result<(State<F>, Vec<AssignedBits<32, F>>), Error> {
+        let last_state = self.states.last().unwrap();
+        let last_digest = self.last_assigned_digest(ctx)?;
+        let (compressed_state, assigned_inputs) =
+            self.table16_chip().compress(layouter, last_state, input)?;
+        let compressed_state_values = self.state_to_assigned_halves(ctx, &compressed_state)?;
+        let main_gate = self.main_gate();
+        let range_chip = self.range_chip();
+
+        let word_sums = last_digest
+            .iter()
+            .zip(&compressed_state_values)
+            .map(|(digest_word, comp_word)| main_gate.add(ctx, digest_word, comp_word))
+            .collect::<Result<Vec<AssignedValue<F>>, Error>>()?;
+        let u32_sub_1 = 1u128 << 32 - 1;
+        let lo_his = word_sums
+            .iter()
+            .map(|sum| {
+                sum.value()
+                    .map(|v| {
+                        (
+                            F::from_u128(v.get_lower_128() % u32_sub_1),
+                            F::from_u128(v.get_lower_128() >> 32),
+                        )
+                    })
+                    .unzip()
+            })
+            .collect::<Vec<(Value<F>, Value<F>)>>();
+        let assigned_los = lo_his
+            .iter()
+            .map(|(lo, _)| range_chip.assign(ctx, *lo, 32 / Self::NUM_LOOKUP_TABLES, 32))
+            .collect::<Result<Vec<AssignedValue<F>>, Error>>()?;
+        let assigned_his = lo_his
+            .iter()
+            .map(|(_, hi)| main_gate.assign_value(ctx, *hi))
+            .collect::<Result<Vec<AssignedValue<F>>, Error>>()?;
+        let u32 = main_gate.assign_constant(ctx, F::from(1 << 32))?;
+
+        let combines = assigned_los
+            .iter()
+            .zip(&assigned_his)
+            .map(|(lo, hi)| main_gate.mul_add(ctx, hi, &u32, lo))
+            .collect::<Result<Vec<AssignedValue<F>>, Error>>()?;
+        for (combine, word_sum) in combines.iter().zip(&word_sums) {
+            main_gate.assert_equal(ctx, combine, word_sum)?;
+        }
+
+        let mut new_state_word_vals = [Value::unknown(); STATE];
+        for i in 0..STATE {
+            new_state_word_vals[i] = assigned_los[i].value().map(|v| v.get_lower_32());
+        }
+        let new_state = self
+            .table16_chip()
+            .compression_config()
+            .initialize_with_iv(layouter, new_state_word_vals)?;
+
+        Ok((new_state, assigned_inputs))
+    }
+
+    fn state_to_assigned_halves(
+        &self,
+        ctx: &mut RegionCtx<F>,
+        state: &State<F>,
+    ) -> Result<[AssignedValue<F>; DIGEST_SIZE], Error> {
+        let (a, b, c, d, e, f, g, h) = state.split_state();
+
+        let assigned_cells = [
+            self.concat_word_halves(ctx, a.dense_halves())?,
+            self.concat_word_halves(ctx, b.dense_halves())?,
+            self.concat_word_halves(ctx, c.dense_halves())?,
+            self.concat_word_halves(ctx, d)?,
+            self.concat_word_halves(ctx, e.dense_halves())?,
+            self.concat_word_halves(ctx, f.dense_halves())?,
+            self.concat_word_halves(ctx, g.dense_halves())?,
+            self.concat_word_halves(ctx, h)?,
+        ];
+        Ok(assigned_cells)
+    }
+
+    fn concat_word_halves(
+        &self,
+        ctx: &mut RegionCtx<F>,
+        word: RoundWordDense<F>,
+    ) -> Result<AssignedValue<F>, Error> {
+        let (lo, hi) = word.halves();
+        let main_gate = self.main_gate();
+        let u16 = main_gate.assign_constant(ctx, F::from(1 << 16))?;
+
+        let val_u32 = word.value();
+        let val_lo = val_u32.map(|v| F::from_u128((v & (1 << 16 - 1)) as u128));
+        let val_hi = val_u32.map(|v| F::from_u128((v >> 16) as u128));
+        let assigned_lo = main_gate.assign_value(ctx, val_lo)?;
+        let assigned_hi = main_gate.assign_value(ctx, val_hi)?;
+        ctx.constrain_equal(lo.cell(), assigned_lo.cell())?;
+        ctx.constrain_equal(hi.cell(), assigned_hi.cell())?;
+
+        main_gate.mul_add(ctx, &assigned_hi, &u16, &assigned_lo)
+    }
+
+    /*
     /// Digest data, updating the internal state.
     pub fn update(
         &mut self,
@@ -134,7 +661,7 @@ impl<F: FieldExt, Sha256Chip: Sha256Instructions<F>> Sha256<F, Sha256Chip> {
         self.cur_block.extend_from_slice(rem);
 
         Ok(())
-    }
+    }*/
 
     /*
     /// Retrieve result and consume hasher instance.

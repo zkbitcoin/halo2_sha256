@@ -1,7 +1,7 @@
 use std::convert::TryInto;
 use std::marker::PhantomData;
 
-use super::Sha256Instructions;
+use crate::sha256::Sha256Compression;
 use halo2wrong::{
     curves::FieldExt,
     halo2::{
@@ -17,13 +17,14 @@ mod spread_table;
 mod util;
 
 use compression::*;
+pub use compression::{RoundWordDense, State};
 use gates::*;
 use message_schedule::*;
 use spread_table::*;
-use util::*;
+pub(crate) use util::*;
 
-const ROUNDS: usize = 64;
-const STATE: usize = 8;
+pub(crate) const ROUNDS: usize = 64;
+pub(crate) const STATE: usize = 8;
 
 #[allow(clippy::unreadable_literal)]
 pub(crate) const ROUND_CONSTANTS: [u32; ROUNDS] = [
@@ -52,6 +53,12 @@ const IV: [u32; STATE] = [
 /// A word in a `Table16` message block.
 // TODO: Make the internals of this struct private.
 pub struct BlockWord(pub Value<u32>);
+
+impl From<u32> for BlockWord {
+    fn from(val: u32) -> Self {
+        Self(Value::known(val))
+    }
+}
 
 #[derive(Clone, Debug)]
 /// Little-endian bits (up to 64 bits)
@@ -126,7 +133,7 @@ impl<const LEN: usize, F: FieldExt> std::ops::Deref for AssignedBits<LEN, F> {
 }
 
 impl<const LEN: usize, F: FieldExt> AssignedBits<LEN, F> {
-    fn assign_bits<A, AR, T: TryInto<[bool; LEN]> + std::fmt::Debug + Clone>(
+    pub fn assign_bits<A, AR, T: TryInto<[bool; LEN]> + std::fmt::Debug + Clone>(
         region: &mut Region<'_, F>,
         annotation: A,
         column: impl Into<Column<Any>>,
@@ -160,11 +167,11 @@ impl<const LEN: usize, F: FieldExt> AssignedBits<LEN, F> {
 }
 
 impl<F: FieldExt> AssignedBits<16, F> {
-    fn value_u16(&self) -> Value<u16> {
+    pub fn value_u16(&self) -> Value<u16> {
         self.value().map(|v| v.into())
     }
 
-    fn assign<A, AR>(
+    pub fn assign<A, AR>(
         region: &mut Region<'_, F>,
         annotation: A,
         column: impl Into<Column<Any>>,
@@ -195,11 +202,11 @@ impl<F: FieldExt> AssignedBits<16, F> {
 }
 
 impl<F: FieldExt> AssignedBits<32, F> {
-    fn value_u32(&self) -> Value<u32> {
+    pub fn value_u32(&self) -> Value<u32> {
         self.value().map(|v| v.into())
     }
 
-    fn assign<A, AR>(
+    pub fn assign<A, AR>(
         region: &mut Region<'_, F>,
         annotation: A,
         column: impl Into<Column<Any>>,
@@ -323,19 +330,24 @@ impl<F: FieldExt> Table16Chip<F> {
     }
 }
 
-impl<F: FieldExt> Sha256Instructions<F> for Table16Chip<F> {
+impl<F: FieldExt> Sha256Compression<F> for Table16Chip<F> {
     type State = State<F>;
     type BlockWord = BlockWord;
-
     fn initialization_vector(&self, layouter: &mut impl Layouter<F>) -> Result<State<F>, Error> {
-        self.config().compression.initialize_with_iv(layouter, IV)
+        let mut init_vector = [Value::unknown(); STATE];
+        for i in 0..STATE {
+            init_vector[i] = Value::known(IV[i]);
+        }
+        self.config()
+            .compression
+            .initialize_with_iv(layouter, init_vector)
     }
 
     fn initialization(
         &self,
         layouter: &mut impl Layouter<F>,
-        init_state: &Self::State,
-    ) -> Result<Self::State, Error> {
+        init_state: &State<F>,
+    ) -> Result<State<F>, Error> {
         self.config()
             .compression
             .initialize_with_state(layouter, init_state.clone())
@@ -346,24 +358,31 @@ impl<F: FieldExt> Sha256Instructions<F> for Table16Chip<F> {
     fn compress(
         &self,
         layouter: &mut impl Layouter<F>,
-        initialized_state: &Self::State,
-        input: [Self::BlockWord; super::BLOCK_SIZE],
-    ) -> Result<Self::State, Error> {
+        initialized_state: &State<F>,
+        input: [BlockWord; super::BLOCK_SIZE],
+    ) -> Result<(State<F>, Vec<AssignedBits<32, F>>), Error> {
         let config = self.config();
-        let (_, w_halves) = config.message_schedule.process(layouter, input)?;
-        config
+        let (_, w_halves, assigned_inputs) = config.message_schedule.process(layouter, input)?;
+        let state = config
             .compression
-            .compress(layouter, initialized_state.clone(), w_halves)
+            .compress(layouter, initialized_state.clone(), w_halves)?;
+        Ok((state, assigned_inputs))
     }
 
-    fn digest(
+    /*fn digest(
         &self,
         layouter: &mut impl Layouter<F>,
-        state: &Self::State,
-    ) -> Result<[Self::BlockWord; super::DIGEST_SIZE], Error> {
+        state: &State<F>,
+    ) -> Result<[BlockWord; super::DIGEST_SIZE], Error> {
         // Copy the dense forms of the state variable chunks down to this gate.
         // Reconstruct the 32-bit dense words.
         self.config().compression.digest(layouter, state.clone())
+    }*/
+}
+
+impl<F: FieldExt> Table16Chip<F> {
+    pub(crate) fn compression_config(&self) -> CompressionConfig {
+        self.config.compression.clone()
     }
 }
 
@@ -444,18 +463,20 @@ trait Table16Assignment<F: FieldExt> {
 }
 
 #[cfg(test)]
-#[cfg(feature = "dev-graph")]
 mod tests {
-    use super::super::{Sha256, BLOCK_SIZE};
+    use super::super::BLOCK_SIZE;
+    use super::compression::COMPRESSION_OUTPUT;
+    use super::*;
     use super::{message_schedule::msg_schedule_test_input, Table16Chip, Table16Config};
+    use halo2wrong::curves::pasta::Fp;
     use halo2wrong::halo2::{
-        circuit::{Layouter, SimpleFloorPlanner},
-        plonk::{Circuit, ConstraintSystem, Error},
+        arithmetic::FieldExt,
+        circuit::{Layouter, SimpleFloorPlanner, Value},
+        dev::MockProver,
+        plonk::{Advice, Circuit, Column, ConstraintSystem, Error},
     };
-
     #[test]
-    fn print_sha256_circuit() {
-        use plotters::prelude::*;
+    fn test_sha256_circuit() {
         struct MyCircuit {}
 
         impl<F: FieldExt> Circuit<F> for MyCircuit {
@@ -476,33 +497,27 @@ mod tests {
                 mut layouter: impl Layouter<F>,
             ) -> Result<(), Error> {
                 let table16_chip = Table16Chip::construct(config.clone());
-                Table16Chip::load(config, &mut layouter)?;
+                Table16Chip::load(config.clone(), &mut layouter)?;
 
                 // Test vector: "abc"
                 let test_input = msg_schedule_test_input();
-
-                // Create a message of length 31 blocks
-                let mut input = Vec::with_capacity(31 * BLOCK_SIZE);
-                for _ in 0..31 {
-                    input.extend_from_slice(&test_input);
+                let state = table16_chip.initialization_vector(&mut layouter)?;
+                let (state, _) = table16_chip.compress(&mut layouter, &state, test_input)?;
+                let digest = config.compression.digest(&mut layouter, state)?;
+                for (idx, digest_word) in digest.iter().enumerate() {
+                    digest_word.0.assert_if_known(|digest_word| {
+                        (*digest_word as u64 + IV[idx] as u64) as u32 == COMPRESSION_OUTPUT[idx]
+                    });
                 }
-
-                Sha256::digest(table16_chip, layouter.namespace(|| "'abc' * 31"), &input)?;
-
                 Ok(())
             }
         }
 
-        let root =
-            BitMapBackend::new("sha-256-table16-chip-layout.png", (1024, 3480)).into_drawing_area();
-        root.fill(&WHITE).unwrap();
-        let root = root
-            .titled("16-bit Table SHA-256 Chip", ("sans-serif", 60))
-            .unwrap();
-
         let circuit = MyCircuit {};
-        halo2_proofs::dev::CircuitLayout::default()
-            .render::<pallas::Base, _, _>(17, &circuit, &root)
-            .unwrap();
+        let prover = match MockProver::<Fp>::run(17, &circuit, vec![]) {
+            Ok(prover) => prover,
+            Err(e) => panic!("{:?}", e),
+        };
+        assert_eq!(prover.verify(), Ok(()));
     }
 }

@@ -312,11 +312,13 @@ impl MessageScheduleConfig {
         (
             [MessageWord<F>; ROUNDS],
             [(AssignedBits<16, F>, AssignedBits<16, F>); ROUNDS],
+            Vec<AssignedBits<32, F>>,
         ),
         Error,
     > {
         let mut w = Vec::<MessageWord<F>>::with_capacity(ROUNDS);
         let mut w_halves = Vec::<(AssignedBits<16, F>, AssignedBits<16, F>)>::with_capacity(ROUNDS);
+        let mut assigned_inputs = Vec::<AssignedBits<32, F>>::with_capacity(BLOCK_SIZE);
 
         layouter.assign_region(
             || "process message block",
@@ -361,6 +363,7 @@ impl MessageScheduleConfig {
                 // Assign W[0..16]
                 for (i, word) in input.iter().enumerate() {
                     let (word, halves) = self.assign_word_and_halves(&mut region, word.0, i)?;
+                    assigned_inputs.push(word.clone());
                     w.push(MessageWord(word));
                     w_halves.push(halves);
                 }
@@ -389,7 +392,11 @@ impl MessageScheduleConfig {
             },
         )?;
 
-        Ok((w.try_into().unwrap(), w_halves.try_into().unwrap()))
+        Ok((
+            w.try_into().unwrap(),
+            w_halves.try_into().unwrap(),
+            assigned_inputs,
+        ))
     }
 }
 
@@ -435,7 +442,7 @@ mod tests {
                 let inputs: [BlockWord; BLOCK_SIZE] = msg_schedule_test_input();
 
                 // Run message_scheduler to get W_[0..64]
-                let (w, _) = config.message_schedule.process(&mut layouter, inputs)?;
+                let (w, _, _) = config.message_schedule.process(&mut layouter, inputs)?;
                 for (word, test_word) in w.iter().zip(MSG_SCHEDULE_TEST_OUTPUT.iter()) {
                     word.value().assert_if_known(|bits| {
                         let word: u32 = lebs2ip(bits) as u32;
