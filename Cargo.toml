@@ -6,8 +6,10 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-halo2wrong =  { git = "https://github.com/privacy-scaling-explorations/halo2wrong", version = "0.1.0", rev = "ed953b054b906b64787dc9a8cbefc0db4be9f8fa"}
-maingate = { git = "https://github.com/privacy-scaling-explorations/halo2wrong", version = "0.1.0", rev = "ed953b054b906b64787dc9a8cbefc0db4be9f8fa"}
+# halo2wrong =  { git = "https://github.com/privacy-scaling-explorations/halo2wrong", version = "0.1.0", rev = "ed953b054b906b64787dc9a8cbefc0db4be9f8fa"}
+halo2wrong = { version = "0.1.0", path = "../privacy-scaling-explorations/halo2wrong/halo2wrong" }
+# maingate = { git = "https://github.com/privacy-scaling-explorations/halo2wrong", version = "0.1.0", rev = "ed953b054b906b64787dc9a8cbefc0db4be9f8fa"}
+maingate = { version = "0.1.0", path = "../privacy-scaling-explorations/halo2wrong/maingate" }
 
 [dev-dependencies]
 criterion = "0.3"
